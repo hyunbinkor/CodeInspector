@@ -228,7 +228,7 @@ export class QdrantClient {
   }
 
   /**
-   * 패턴 배열 파싱 - RegExp 변환 포함 (기존 qdrantAdapter.js 로직)
+   * 패턴 배열 파싱 - RegExp 변환 포함 (PCRE → JavaScript 변환)
    * @private
    */
   _parsePatternArray(jsonStr) {
@@ -240,28 +240,127 @@ export class QdrantClient {
       
       return patterns.map(p => {
         try {
+          let patternStr, flags, description;
+          
           if (typeof p === 'object' && p.pattern) {
+            patternStr = p.pattern;
+            flags = p.flags || 'g';
+            description = p.description || '';
+          } else if (typeof p === 'string') {
+            patternStr = p;
+            flags = 'g';
+            description = '';
+          } else {
+            return null;
+          }
+          
+          // PCRE → JavaScript 변환
+          const converted = this._convertPCREtoJS(patternStr, flags);
+          patternStr = converted.pattern;
+          flags = converted.flags;
+          
+          return {
+            regex: new RegExp(patternStr, flags),
+            description
+          };
+        } catch (e) {
+          // 변환 실패 시 추가 정제 시도
+          try {
+            const sanitized = this._sanitizePattern(p.pattern || p);
+            const flags = p.flags || 'g';
             return {
-              regex: new RegExp(p.pattern, p.flags || 'g'),
+              regex: new RegExp(sanitized, flags),
               description: p.description || ''
             };
+          } catch (e2) {
+            logger.warn(`패턴 RegExp 변환 실패: ${JSON.stringify(p).substring(0, 80)}... - ${e.message}`);
+            return null;
           }
-          if (typeof p === 'string') {
-            return {
-              regex: new RegExp(p, 'g'),
-              description: ''
-            };
-          }
-          return null;
-        } catch (e) {
-          logger.warn(`패턴 RegExp 변환 실패: ${JSON.stringify(p)} - ${e.message}`);
-          return null;
         }
       }).filter(p => p !== null);
     } catch (e) {
       logger.warn(`패턴 배열 JSON 파싱 실패: ${e.message}`);
       return [];
     }
+  }
+  
+  /**
+   * PCRE 정규식을 JavaScript RegExp로 변환
+   * @private
+   */
+  _convertPCREtoJS(pattern, flags) {
+    let newPattern = pattern;
+    let newFlags = flags;
+    
+    // 1. Inline flags 추출 및 제거: (?i), (?s), (?m), (?x), (?imsx) 등
+    const inlineFlagMatch = newPattern.match(/^\(\?([imsx]+)\)/);
+    if (inlineFlagMatch) {
+      const inlineFlags = inlineFlagMatch[1];
+      newPattern = newPattern.replace(/^\(\?[imsx]+\)/, '');
+      
+      if (inlineFlags.includes('i') && !newFlags.includes('i')) {
+        newFlags += 'i';
+      }
+      if (inlineFlags.includes('m') && !newFlags.includes('m')) {
+        newFlags += 'm';
+      }
+    }
+    
+    // 2. 패턴 중간의 inline flags도 제거
+    newPattern = newPattern.replace(/\(\?[imsx]+:/g, '(?:');
+    newPattern = newPattern.replace(/\(\?[imsx]+\)/g, '');
+    
+    // 3. Atomic groups (?>...) → (?:...)
+    newPattern = newPattern.replace(/\(\?>/g, '(?:');
+    
+    // 4. Possessive quantifiers ++, *+, ?+ → +, *, ?
+    newPattern = newPattern.replace(/\+\+/g, '+');
+    newPattern = newPattern.replace(/\*\+/g, '*');
+    newPattern = newPattern.replace(/\?\+/g, '?');
+    
+    // 5. Named groups (?P<n>...) → (?<n>...)
+    newPattern = newPattern.replace(/\(\?P</g, '(?<');
+    
+    // 6. Named backreference (?P=name) → \k<n>
+    newPattern = newPattern.replace(/\(\?P=(\w+)\)/g, '\\k<$1>');
+    
+    return { pattern: newPattern, flags: newFlags };
+  }
+  
+  /**
+   * 패턴 추가 정제
+   * @private
+   */
+  _sanitizePattern(pattern) {
+    if (typeof pattern !== 'string') return '';
+    
+    let sanitized = pattern;
+    
+    // PCRE inline flags 제거
+    sanitized = sanitized.replace(/^\(\?[imsx]+\)/, '');
+    sanitized = sanitized.replace(/\(\?[imsx]+:/g, '(?:');
+    sanitized = sanitized.replace(/\(\?[imsx]+\)/g, '');
+    
+    // 짝이 맞지 않는 괄호 정리
+    let parenCount = 0;
+    let inBracket = false;
+    
+    for (let i = 0; i < sanitized.length; i++) {
+      const char = sanitized[i];
+      const prevChar = i > 0 ? sanitized[i - 1] : '';
+      
+      if (prevChar !== '\\') {
+        if (char === '[' && !inBracket) inBracket = true;
+        else if (char === ']' && inBracket) inBracket = false;
+        else if (char === '(' && !inBracket) parenCount++;
+        else if (char === ')' && !inBracket) parenCount--;
+      }
+    }
+    
+    if (parenCount > 0) sanitized += ')'.repeat(parenCount);
+    if (inBracket) sanitized += ']';
+    
+    return sanitized;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
@@ -366,28 +465,57 @@ export class QdrantClient {
   }
 
   /**
-   * 패턴 정규화 (기존 qdrantAdapter.js 로직)
+   * 패턴 정규화 (저장용) - 유효성 검증 포함
    * @private
    */
   _normalizePatterns(patterns) {
     if (!patterns || !Array.isArray(patterns)) return [];
     
     return patterns.map(p => {
+      let patternStr, flags, description;
+      
       if (typeof p === 'string') {
-        return { pattern: p, flags: 'g', description: '' };
+        patternStr = p;
+        flags = 'g';
+        description = '';
+      } else if (p instanceof RegExp) {
+        patternStr = p.source;
+        flags = p.flags || 'g';
+        description = '';
+      } else if (typeof p === 'object' && p.pattern) {
+        patternStr = typeof p.pattern === 'string' ? p.pattern : p.pattern.source;
+        flags = p.flags || (p.pattern && p.pattern.flags) || 'g';
+        description = p.description || '';
+      } else {
+        return null;
       }
-      if (p instanceof RegExp) {
-        return { pattern: p.source, flags: p.flags || 'g', description: '' };
+      
+      // 🔧 유효성 검증: RegExp로 변환 가능한지 테스트
+      try {
+        new RegExp(patternStr, flags);
+        return { pattern: patternStr, flags, description };
+      } catch (e) {
+        // 이스케이프가 필요한 특수문자 자동 처리 시도
+        const escaped = this._escapeRegexSpecialChars(patternStr);
+        try {
+          new RegExp(escaped, flags);
+          logger.debug(`패턴 자동 이스케이프: "${patternStr.substring(0, 50)}"`);
+          return { pattern: escaped, flags, description };
+        } catch (e2) {
+          logger.warn(`⚠️ 유효하지 않은 패턴 제외: "${patternStr.substring(0, 50)}..." - ${e.message}`);
+          return null;
+        }
       }
-      if (typeof p === 'object' && p.pattern) {
-        return {
-          pattern: typeof p.pattern === 'string' ? p.pattern : p.pattern.source,
-          flags: p.flags || (p.pattern && p.pattern.flags) || 'g',
-          description: p.description || ''
-        };
-      }
-      return null;
     }).filter(p => p !== null);
+  }
+  
+  /**
+   * 정규식 특수문자 이스케이프 (저장 시 자동 보정)
+   * @private
+   */
+  _escapeRegexSpecialChars(str) {
+    // 정규식 특수문자를 이스케이프 (이미 이스케이프된 것은 유지)
+    return str.replace(/(?<!\\)([.*+?^${}()|\[\]])/g, '\\$1');
   }
 
   /**

@@ -320,24 +320,152 @@ JSON만 출력하세요.`;
     }
     
     return patterns.map(p => {
+      let patternStr, flags, description;
+      
       // 이미 객체인 경우
       if (typeof p === 'object' && p.pattern) {
-        return {
-          pattern: p.pattern,
-          flags: p.flags || 'g',
-          description: p.description || ''
-        };
+        patternStr = p.pattern;
+        flags = p.flags || 'g';
+        description = p.description || '';
       }
       // 문자열인 경우
-      if (typeof p === 'string') {
-        return {
-          pattern: p,
-          flags: 'g',
-          description: ''
-        };
+      else if (typeof p === 'string') {
+        patternStr = p;
+        flags = 'g';
+        description = '';
       }
-      return null;
+      else {
+        return null;
+      }
+      
+      // 🔧 PCRE → JavaScript 변환
+      const converted = this._convertPCREtoJS(patternStr, flags);
+      patternStr = converted.pattern;
+      flags = converted.flags;
+      
+      // 🔧 유효성 검증: RegExp로 변환 가능한지 테스트
+      try {
+        new RegExp(patternStr, flags);
+        return { pattern: patternStr, flags, description };
+      } catch (e) {
+        // 추가 정제 시도
+        const sanitized = this._sanitizePattern(patternStr);
+        try {
+          new RegExp(sanitized, flags);
+          logger.debug(`패턴 자동 정제: "${patternStr.substring(0, 50)}"`);
+          return { pattern: sanitized, flags, description };
+        } catch (e2) {
+          logger.warn(`⚠️ 유효하지 않은 패턴 제외: "${patternStr.substring(0, 50)}..." - ${e.message}`);
+          return null;
+        }
+      }
     }).filter(p => p !== null && p.pattern);
+  }
+  
+  /**
+   * PCRE 정규식을 JavaScript RegExp로 변환
+   * @private
+   */
+  _convertPCREtoJS(pattern, flags) {
+    let newPattern = pattern;
+    let newFlags = flags;
+    
+    // 1. Inline flags 추출 및 제거: (?i), (?s), (?m), (?x), (?imsx) 등
+    const inlineFlagMatch = newPattern.match(/^\(\?([imsx]+)\)/);
+    if (inlineFlagMatch) {
+      const inlineFlags = inlineFlagMatch[1];
+      newPattern = newPattern.replace(/^\(\?[imsx]+\)/, '');
+      
+      // flags에 추가 (중복 제거)
+      if (inlineFlags.includes('i') && !newFlags.includes('i')) {
+        newFlags += 'i';
+      }
+      if (inlineFlags.includes('m') && !newFlags.includes('m')) {
+        newFlags += 'm';
+      }
+      // (?s) dotall - JavaScript에서는 [\\s\\S] 사용해야 함
+      // (?x) verbose - JavaScript에서 미지원, 공백 제거 필요
+    }
+    
+    // 2. 패턴 중간의 inline flags도 제거: (?i:...), (?:...) 등
+    newPattern = newPattern.replace(/\(\?[imsx]+:/g, '(?:');
+    newPattern = newPattern.replace(/\(\?[imsx]+\)/g, '');
+    
+    // 3. PCRE 전용 기능 변환
+    // (?s) dotall 모드의 . → [\s\S]로 변환 (이미 [\s\S] 사용 중이면 유지)
+    // 주의: 이건 복잡하므로 일단 보류
+    
+    // 4. Atomic groups (?>...) → (?:...) (JavaScript 미지원)
+    newPattern = newPattern.replace(/\(\?>/g, '(?:');
+    
+    // 5. Possessive quantifiers ++, *+, ?+ → +, *, ? (JavaScript 미지원)
+    newPattern = newPattern.replace(/\+\+/g, '+');
+    newPattern = newPattern.replace(/\*\+/g, '*');
+    newPattern = newPattern.replace(/\?\+/g, '?');
+    
+    // 6. Named groups (?P<name>...) → (?<name>...) (ES2018+)
+    newPattern = newPattern.replace(/\(\?P</g, '(?<');
+    
+    // 7. Named backreference (?P=name) → \k<name> (ES2018+)
+    newPattern = newPattern.replace(/\(\?P=(\w+)\)/g, '\\k<$1>');
+    
+    return { pattern: newPattern, flags: newFlags };
+  }
+  
+  /**
+   * 패턴 추가 정제 (변환 후에도 실패할 경우)
+   * @private
+   */
+  _sanitizePattern(pattern) {
+    let sanitized = pattern;
+    
+    // 짝이 맞지 않는 괄호 제거 시도
+    // 닫히지 않은 문자 클래스 [] 체크
+    let bracketCount = 0;
+    let parenCount = 0;
+    let inBracket = false;
+    
+    for (let i = 0; i < sanitized.length; i++) {
+      const char = sanitized[i];
+      const prevChar = i > 0 ? sanitized[i - 1] : '';
+      
+      if (prevChar !== '\\') {
+        if (char === '[' && !inBracket) {
+          inBracket = true;
+          bracketCount++;
+        } else if (char === ']' && inBracket) {
+          inBracket = false;
+        } else if (char === '(' && !inBracket) {
+          parenCount++;
+        } else if (char === ')' && !inBracket) {
+          parenCount--;
+        }
+      }
+    }
+    
+    // 닫히지 않은 괄호가 있으면 간단히 제거
+    if (parenCount > 0) {
+      // 끝에 닫는 괄호 추가
+      sanitized += ')'.repeat(parenCount);
+    } else if (parenCount < 0) {
+      // 시작에 여는 괄호 추가 (비정상적인 케이스)
+      sanitized = '('.repeat(-parenCount) + sanitized;
+    }
+    
+    // 닫히지 않은 문자 클래스
+    if (inBracket) {
+      sanitized += ']';
+    }
+    
+    return sanitized;
+  }
+  
+  /**
+   * 정규식 특수문자 이스케이프
+   * @private
+   */
+  _escapeRegexSpecialChars(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   /**
