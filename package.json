@@ -1,0 +1,29 @@
+{
+  "name": "code-quality-checker",
+  "version": "1.0.0",
+  "description": "코드 품질 점검 시스템 - 태깅 기반 룰 매칭",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "extract-guidelines": "node src/main.js extract-guidelines",
+    "extract-issues": "node src/main.js extract-issues",
+    "check": "node src/main.js check",
+    "help": "node src/main.js help"
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.15.1",
+    "csv-parse": "^5.5.0",
+    "dotenv": "^16.3.1",
+    "java-parser": "^2.0.4",
+    "jszip": "^3.10.1",
+    "uuid": "^9.0.1",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

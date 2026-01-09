@@ -1,0 +1,119 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "rule.schema.json",
+  "title": "Rule Schema",
+  "description": "코드 품질 검사 규칙 스키마",
+  "type": "object",
+  
+  "required": ["ruleId", "title", "description", "category", "severity"],
+  
+  "properties": {
+    "ruleId": {
+      "type": "string",
+      "description": "규칙 고유 식별자",
+      "pattern": "^[A-Z]{2,5}-[A-Z]?[0-9]{3}$",
+      "examples": ["RES-001", "SEC-I001", "ERR-002"]
+    },
+    
+    "title": {
+      "type": "string",
+      "description": "규칙 제목",
+      "maxLength": 100
+    },
+    
+    "description": {
+      "type": "string",
+      "description": "규칙 상세 설명",
+      "maxLength": 1000
+    },
+    
+    "category": {
+      "type": "string",
+      "description": "규칙 카테고리",
+      "enum": [
+        "resource_management",
+        "security",
+        "exception_handling",
+        "performance",
+        "architecture",
+        "code_style",
+        "naming_convention",
+        "documentation",
+        "general"
+      ]
+    },
+    
+    "severity": {
+      "type": "string",
+      "description": "심각도",
+      "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+      "default": "MEDIUM"
+    },
+    
+    "tagCondition": {
+      "type": ["string", "null"],
+      "description": "태그 매칭 조건 (논리식)",
+      "examples": [
+        "USES_CONNECTION && !HAS_TRY_WITH_RESOURCES",
+        "HAS_SQL_CONCATENATION",
+        "IS_CONTROLLER && IS_DAO"
+      ]
+    },
+    
+    "requiredTags": {
+      "type": "array",
+      "description": "필수 태그 (모두 있어야 매칭)",
+      "items": { "type": "string" },
+      "default": []
+    },
+    
+    "excludeTags": {
+      "type": "array",
+      "description": "제외 태그 (하나라도 있으면 미매칭)",
+      "items": { "type": "string" },
+      "default": []
+    },
+    
+    "checkType": {
+      "type": "string",
+      "description": "검사 방식",
+      "enum": ["pure_regex", "llm_with_regex", "llm_contextual"],
+      "default": "llm_contextual"
+    },
+    
+    "checkPrompt": {
+      "type": ["string", "null"],
+      "description": "LLM 검사용 커스텀 프롬프트"
+    },
+    
+    "message": {
+      "type": "string",
+      "description": "위반 시 표시 메시지",
+      "maxLength": 200
+    },
+    
+    "suggestion": {
+      "type": "string",
+      "description": "개선 제안",
+      "maxLength": 500
+    },
+    
+    "source": {
+      "type": "string",
+      "description": "규칙 출처",
+      "examples": ["guideline:2.3절", "issue:extracted"]
+    },
+    
+    "occurrenceCount": {
+      "type": "integer",
+      "description": "발생 빈도 (이슈 기반 룰)",
+      "minimum": 1
+    },
+    
+    "isActive": {
+      "type": "boolean",
+      "description": "활성화 여부",
+      "default": true
+    }
+  }
+}

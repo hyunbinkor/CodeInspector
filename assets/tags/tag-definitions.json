@@ -1,0 +1,691 @@
+{
+  "_metadata": {
+    "version": "1.0.0",
+    "description": "Java 코드 프로파일링용 태그 정의",
+    "lastUpdated": "2025-01-15",
+    "totalTags": 45
+  },
+  "tagCategories": {
+    "structure": "클래스/메서드 구조 관련",
+    "resource": "리소스 관리 관련",
+    "call": "메서드/클래스 호출 관련",
+    "pattern": "코드 패턴 관련",
+    "framework": "프레임워크 사용 관련",
+    "financial": "금융권 특수 패턴",
+    "metric": "코드 메트릭 기반"
+  },
+  "tags": {
+    "IS_CONTROLLER": {
+      "category": "structure",
+      "description": "@Controller 또는 @RestController 어노테이션이 있는 클래스",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@Controller\\b",
+          "@RestController\\b"
+        ],
+        "matchType": "any"
+      }
+    },
+    "IS_SERVICE": {
+      "category": "structure",
+      "description": "@Service 어노테이션이 있는 클래스",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@Service\\b"
+        ],
+        "matchType": "any"
+      }
+    },
+    "IS_REPOSITORY": {
+      "category": "structure",
+      "description": "@Repository 어노테이션이 있는 클래스",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@Repository\\b"
+        ],
+        "matchType": "any"
+      }
+    },
+    "IS_ENTITY": {
+      "category": "structure",
+      "description": "@Entity 어노테이션이 있는 JPA 엔티티 클래스",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@Entity\\b"
+        ],
+        "matchType": "any"
+      }
+    },
+    "IS_COMPONENT": {
+      "category": "structure",
+      "description": "@Component 어노테이션이 있는 클래스",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@Component\\b"
+        ],
+        "matchType": "any"
+      }
+    },
+    "IS_DAO": {
+      "category": "structure",
+      "description": "DAO 클래스 (클래스명이 *DAO, *Dao로 끝남)",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "class\\s+\\w+[Dd][Aa][Oo]\\s*[{<]",
+          "class\\s+\\w+Dao\\s*[{<]"
+        ],
+        "matchType": "any"
+      }
+    },
+    "USES_CONNECTION": {
+      "category": "resource",
+      "description": "JDBC Connection 객체 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "Connection\\s+\\w+",
+          "getConnection\\s*\\(",
+          "\\.getConnection\\s*\\("
+        ],
+        "matchType": "any",
+        "excludeInComments": true
+      }
+    },
+    "USES_STATEMENT": {
+      "category": "resource",
+      "description": "JDBC Statement 객체 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "Statement\\s+\\w+",
+          "PreparedStatement\\s+\\w+",
+          "createStatement\\s*\\(",
+          "prepareStatement\\s*\\("
+        ],
+        "matchType": "any",
+        "excludeInComments": true
+      }
+    },
+    "USES_RESULTSET": {
+      "category": "resource",
+      "description": "JDBC ResultSet 객체 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "ResultSet\\s+\\w+",
+          "executeQuery\\s*\\("
+        ],
+        "matchType": "any",
+        "excludeInComments": true
+      }
+    },
+    "USES_STREAM": {
+      "category": "resource",
+      "description": "Java Stream (InputStream, OutputStream 등) 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "InputStream\\s+\\w+",
+          "OutputStream\\s+\\w+",
+          "FileInputStream",
+          "FileOutputStream",
+          "BufferedReader",
+          "BufferedWriter"
+        ],
+        "matchType": "any",
+        "excludeInComments": true
+      }
+    },
+    "HAS_TRY_WITH_RESOURCES": {
+      "category": "pattern",
+      "description": "try-with-resources 구문 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "try\\s*\\([^)]+\\)\\s*\\{"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_FINALLY_BLOCK": {
+      "category": "pattern",
+      "description": "finally 블록 존재",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "\\}\\s*finally\\s*\\{"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_CLOSE_CALL": {
+      "category": "pattern",
+      "description": ".close() 메서드 호출 존재",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "\\.close\\s*\\(\\s*\\)"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_CLOSE_IN_FINALLY": {
+      "category": "pattern",
+      "description": "finally 블록 내에서 close() 호출",
+      "extractionMethod": "ast_context",
+      "tier": 1,
+      "detection": {
+        "type": "ast_context",
+        "context": "finally",
+        "patterns": [
+          "\\.close\\s*\\(\\s*\\)"
+        ]
+      }
+    },
+    "HAS_LOOP": {
+      "category": "pattern",
+      "description": "루프 구문 존재 (for, while, do-while)",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "\\bfor\\s*\\(",
+          "\\bwhile\\s*\\(",
+          "\\bdo\\s*\\{"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_NESTED_LOOP": {
+      "category": "pattern",
+      "description": "중첩 루프 존재",
+      "extractionMethod": "ast",
+      "tier": 1,
+      "detection": {
+        "type": "ast",
+        "nodeType": "loop",
+        "condition": "nested"
+      }
+    },
+    "HAS_DB_CALL_IN_LOOP": {
+      "category": "pattern",
+      "description": "루프 내에서 DB 호출 (N+1 쿼리 위험)",
+      "extractionMethod": "ast_context",
+      "tier": 1,
+      "detection": {
+        "type": "ast_context",
+        "context": [
+          "ForStatement",
+          "WhileStatement",
+          "DoStatement"
+        ],
+        "patterns": [
+          "executeQuery",
+          "executeUpdate",
+          "execute\\s*\\(",
+          "\\.find",
+          "\\.save",
+          "\\.delete"
+        ]
+      }
+    },
+    "HAS_EMPTY_CATCH": {
+      "category": "pattern",
+      "description": "빈 catch 블록 존재",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "catch\\s*\\([^)]+\\)\\s*\\{\\s*\\}"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_GENERIC_CATCH": {
+      "category": "pattern",
+      "description": "catch(Exception e) 또는 catch(Throwable t) 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "catch\\s*\\(\\s*Exception\\s+",
+          "catch\\s*\\(\\s*Throwable\\s+"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_SQL_CONCATENATION": {
+      "category": "pattern",
+      "description": "SQL 문자열 연결 (SQL Injection 위험)",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "\"SELECT[^\"]*\"\\s*\\+",
+          "\"INSERT[^\"]*\"\\s*\\+",
+          "\"UPDATE[^\"]*\"\\s*\\+",
+          "\"DELETE[^\"]*\"\\s*\\+",
+          "\\+\\s*\"[^\"]*WHERE",
+          "\\+\\s*\"[^\"]*AND",
+          "\\+\\s*\"[^\"]*OR",
+          "\"[^\"]*SELECT[^\"]*\\+",
+          "sql\\s*=\\s*\"[^\"]*\"\\s*\\+"
+        ],
+        "matchType": "any",
+        "caseSensitive": false
+      }
+    },
+    "HAS_HARDCODED_PASSWORD": {
+      "category": "pattern",
+      "description": "하드코딩된 비밀번호 의심",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "password\\s*=\\s*\"[^\"]+\"",
+          "passwd\\s*=\\s*\"[^\"]+\"",
+          "pwd\\s*=\\s*\"[^\"]+\""
+        ],
+        "matchType": "any",
+        "caseSensitive": false
+      }
+    },
+    "HAS_AUTOWIRED": {
+      "category": "framework",
+      "description": "@Autowired 어노테이션 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@Autowired"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_TRANSACTIONAL": {
+      "category": "framework",
+      "description": "@Transactional 어노테이션 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@Transactional"
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_REQUEST_MAPPING": {
+      "category": "framework",
+      "description": "HTTP 매핑 어노테이션 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "@RequestMapping",
+          "@GetMapping",
+          "@PostMapping",
+          "@PutMapping",
+          "@DeleteMapping",
+          "@PatchMapping"
+        ],
+        "matchType": "any"
+      }
+    },
+    "USES_JPA_REPOSITORY": {
+      "category": "framework",
+      "description": "JPA Repository 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "extends\\s+JpaRepository",
+          "extends\\s+CrudRepository",
+          "extends\\s+PagingAndSortingRepository"
+        ],
+        "matchType": "any"
+      }
+    },
+    "USES_LDATA": {
+      "category": "financial",
+      "description": "금융권 LData 구조 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "LData\\s+\\w+",
+          "new\\s+LData\\s*\\(",
+          "\\.getLData\\s*\\(",
+          "\\.setLData\\s*\\("
+        ],
+        "matchType": "any"
+      }
+    },
+    "USES_LMULTIDATA": {
+      "category": "financial",
+      "description": "금융권 LMultiData 구조 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "LMultiData\\s+\\w+",
+          "new\\s+LMultiData\\s*\\("
+        ],
+        "matchType": "any"
+      }
+    },
+    "USES_ISNULL_CHECK": {
+      "category": "financial",
+      "description": "금융권 isNull() 체크 사용",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "\\.isNull\\s*\\(",
+          "LUtil\\.isNull\\s*\\(",
+          "StringUtil\\.isNull\\s*\\("
+        ],
+        "matchType": "any"
+      }
+    },
+    "HAS_BUSINESS_ID": {
+      "category": "financial",
+      "description": "업무ID 패턴 존재 (예: CUST001, ACCT002)",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "[A-Z]{3,4}[0-9]{3,4}"
+        ],
+        "matchType": "any"
+      }
+    },
+    "METHOD_COUNT_HIGH": {
+      "category": "metric",
+      "description": "메서드 수가 많음 (10개 이상)",
+      "extractionMethod": "ast",
+      "tier": 1,
+      "detection": {
+        "type": "ast",
+        "metric": "methodCount",
+        "threshold": 10,
+        "operator": ">="
+      }
+    },
+    "COMPLEXITY_HIGH": {
+      "category": "metric",
+      "description": "순환 복잡도가 높음",
+      "extractionMethod": "ast",
+      "tier": 1,
+      "detection": {
+        "type": "ast",
+        "metric": "cyclomaticComplexity",
+        "threshold": 10,
+        "operator": ">="
+      }
+    },
+    "NESTING_DEEP": {
+      "category": "metric",
+      "description": "중첩 깊이가 깊음 (4단계 이상)",
+      "extractionMethod": "ast",
+      "tier": 1,
+      "detection": {
+        "type": "ast",
+        "metric": "maxNestingDepth",
+        "threshold": 4,
+        "operator": ">="
+      }
+    },
+    "LINE_COUNT_HIGH": {
+      "category": "metric",
+      "description": "클래스 라인 수가 많음 (300줄 이상)",
+      "extractionMethod": "ast",
+      "tier": 1,
+      "detection": {
+        "type": "ast",
+        "metric": "lineCount",
+        "threshold": 300,
+        "operator": ">="
+      }
+    },
+    "CALLS_DAO": {
+      "category": "call",
+      "description": "DAO 클래스/메서드 호출",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "호출하는 객체나 메서드가 *DAO, *Dao 패턴의 클래스에 속하는지 판단",
+        "triggerTags": [
+          "IS_CONTROLLER",
+          "IS_SERVICE"
+        ]
+      }
+    },
+    "CALLS_SERVICE": {
+      "category": "call",
+      "description": "Service 클래스 메서드 호출",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "호출하는 객체나 메서드가 *Service 패턴의 클래스에 속하는지 판단",
+        "triggerTags": [
+          "IS_CONTROLLER"
+        ]
+      }
+    },
+    "CALLS_REPOSITORY": {
+      "category": "call",
+      "description": "Repository 인터페이스 메서드 호출",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "호출하는 객체가 *Repository 패턴이거나 JpaRepository를 상속한 인터페이스인지 판단",
+        "triggerTags": [
+          "IS_CONTROLLER",
+          "IS_SERVICE"
+        ]
+      }
+    },
+    "NAMING_CONVENTION_OK": {
+      "category": "financial",
+      "description": "금융권 메서드 명명 규칙 준수 (sel/reg/mod/del)",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "CRUD 메서드가 금융권 명명 규칙(sel*/reg*/mod*/del*)을 따르는지 판단",
+        "triggerTags": [
+          "IS_SERVICE",
+          "IS_DAO",
+          "IS_REPOSITORY"
+        ]
+      }
+    },
+    "HAS_PROPER_LOGGING": {
+      "category": "pattern",
+      "description": "적절한 로깅 구현 여부",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "주요 비즈니스 로직에 적절한 로깅(info/warn/error)이 있는지 판단",
+        "triggerTags": [
+          "IS_SERVICE",
+          "IS_CONTROLLER"
+        ]
+      }
+    },
+    "HAS_INPUT_VALIDATION": {
+      "category": "pattern",
+      "description": "입력값 검증 로직 존재",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "Controller나 Service에서 입력 파라미터에 대한 null 체크, 범위 검증 등이 있는지 판단",
+        "triggerTags": [
+          "IS_CONTROLLER",
+          "IS_SERVICE"
+        ]
+      }
+    },
+    "LAYER_VIOLATION": {
+      "category": "structure",
+      "description": "레이어 규칙 위반 (예: Controller에서 DAO 직접 호출)",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "Controller에서 DAO/Repository를 직접 호출하거나, Service를 거치지 않고 데이터 접근하는지 판단",
+        "triggerTags": [
+          "IS_CONTROLLER"
+        ]
+      }
+    },
+    "HAS_BUSINESS_COMMENT": {
+      "category": "financial",
+      "description": "업무 설명 주석 존재",
+      "extractionMethod": "llm",
+      "tier": 2,
+      "detection": {
+        "type": "llm",
+        "criteria": "클래스나 메서드에 업무 로직을 설명하는 의미 있는 주석이 있는지 판단",
+        "triggerTags": [
+          "IS_SERVICE",
+          "USES_LDATA"
+        ]
+      }
+    },
+    "MANUAL_REVIEW_REQUIRED": {
+      "category": "meta",
+      "description": "자동 태깅 실패 - 수동 검토 필요",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "^$"
+        ],
+        "matchType": "none"
+      },
+      "notes": "이 태그는 자동 tagCondition 생성이 실패했을 때 할당됩니다. 규칙을 수동으로 검토하거나 --llm 옵션을 사용하세요."
+    },
+    "CONTEXT_DOCUMENT": {
+      "category": "meta",
+      "description": "문서 컨텍스트 섹션 (개요, 범위, 용어 등)",
+      "extractionMethod": "regex",
+      "tier": 1,
+      "detection": {
+        "type": "regex",
+        "patterns": [
+          "^$"
+        ],
+        "matchType": "none"
+      },
+      "notes": "문서의 메타 정보 섹션. 코드 검사 대상 아님."
+    }
+  },
+  "compoundTags": {
+    "RESOURCE_LEAK_RISK": {
+      "description": "리소스 누수 위험",
+      "expression": "(USES_CONNECTION || USES_STATEMENT || USES_RESULTSET || USES_STREAM) && !HAS_TRY_WITH_RESOURCES && !HAS_CLOSE_IN_FINALLY",
+      "severity": "CRITICAL"
+    },
+    "SQL_INJECTION_RISK": {
+      "description": "SQL Injection 위험",
+      "expression": "HAS_SQL_CONCATENATION && (USES_STATEMENT || USES_CONNECTION)",
+      "severity": "CRITICAL"
+    },
+    "N_PLUS_ONE_RISK": {
+      "description": "N+1 쿼리 위험",
+      "expression": "HAS_DB_CALL_IN_LOOP",
+      "severity": "HIGH"
+    },
+    "POOR_ERROR_HANDLING": {
+      "description": "부적절한 예외 처리",
+      "expression": "HAS_EMPTY_CATCH || HAS_GENERIC_CATCH",
+      "severity": "MEDIUM"
+    }
+  },
+  "triggerConditions": {
+    "NAMING_CHECK_NEEDED": {
+      "description": "명명 규칙 검사 필요",
+      "tier1Tags": [
+        "IS_SERVICE",
+        "IS_DAO",
+        "USES_LDATA"
+      ],
+      "tier2Tags": [
+        "NAMING_CONVENTION_OK"
+      ]
+    },
+    "LAYER_CHECK_NEEDED": {
+      "description": "레이어 위반 검사 필요",
+      "tier1Tags": [
+        "IS_CONTROLLER"
+      ],
+      "tier2Tags": [
+        "CALLS_DAO",
+        "CALLS_SERVICE",
+        "LAYER_VIOLATION"
+      ]
+    },
+    "LOGGING_CHECK_NEEDED": {
+      "description": "로깅 검사 필요",
+      "tier1Tags": [
+        "IS_SERVICE",
+        "IS_CONTROLLER"
+      ],
+      "tier2Tags": [
+        "HAS_PROPER_LOGGING"
+      ]
+    }
+  }
+}
