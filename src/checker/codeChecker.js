@@ -213,9 +213,6 @@ export class CodeChecker {
 
     // Step 6: LLM 검증 (후보가 있을 때만)
     if (filterResult.llmCandidates.total > 0) {
-      logger.info(`[${fileName}] LLM 통합 검증...`);
-      this.filteringStats.llmCalls++;
-
       const llmViolations = await this.verifyWithLLM(
         code, astAnalysis, filterResult.llmCandidates, fileName
       );
@@ -568,57 +565,151 @@ export class CodeChecker {
   async verifyWithLLM(sourceCode, astAnalysis, llmCandidates, fileName) {
     const violations = [];
 
-    try {
-      // 섹션별 통합 프롬프트 생성
-      const prompt = this.buildSectionedPrompt(sourceCode, llmCandidates);
+    // 모든 후보를 하나의 배열로 통합
+    const allItems = [
+      ...llmCandidates.llm_with_regex.map(i => ({ ...i, type: 'llm_with_regex' })),
+      ...llmCandidates.llm_contextual.map(i => ({ ...i, type: 'llm_contextual' })),
+      ...llmCandidates.llm_with_ast.map(i => ({ ...i, type: 'llm_with_ast' }))
+    ];
 
-      const response = await this.llmClient.generateCompletion(prompt, {
-        temperature: 0.1,
-        max_tokens: 3000
-      });
+    if (allItems.length === 0) return violations;
 
-      // 응답 파싱
-      const parsed = this.llmClient.cleanAndExtractJSON(response);
-      if (parsed && parsed.violations && Array.isArray(parsed.violations)) {
-        for (const v of parsed.violations) {
-          if (v.violation === true || v.violation === undefined) {
-            // 해당 규칙 찾기
-            const allRules = [
-              ...llmCandidates.llm_with_regex.map(i => i.rule),
-              ...llmCandidates.llm_contextual.map(i => i.rule),
-              ...llmCandidates.llm_with_ast.map(i => i.rule)
-            ];
-            const rule = allRules.find(r => r.ruleId === v.ruleId);
-            const checkType = rule?.checkType || 'llm_contextual';
+    logger.info(`[${fileName}] LLM 개별 검증 시작: ${allItems.length}개 규칙`);
 
+    const truncatedCode = this.truncateCode(sourceCode, 4000);
+
+    // 각 규칙마다 개별 LLM 호출 (정확도 우선)
+    for (let i = 0; i < allItems.length; i++) {
+      const item = allItems[i];
+      const rule = item.rule;
+      const ruleNum = i + 1;
+
+      try {
+        const prompt = this.buildSingleRulePrompt(truncatedCode, item);
+        
+        const startTime = Date.now();
+        const response = await this.llmClient.generateCompletion(prompt, {
+          temperature: 0.1,
+          max_tokens: 3000
+        });
+        const elapsed = Date.now() - startTime;
+
+        // llmCalls 증가
+        this.filteringStats.llmCalls++;
+
+        logger.debug(`[${fileName}] 규칙 ${ruleNum}/${allItems.length} [${rule.ruleId}]: ${elapsed}ms`);
+
+        // 응답 파싱
+        const parsed = this.llmClient.cleanAndExtractJSON(response);
+        
+        if (parsed) {
+          // 단일 위반 객체 또는 violations 배열 처리
+          const violationData = parsed.violation !== undefined ? parsed : 
+                               (parsed.violations?.[0] || null);
+          
+          if (violationData && violationData.violation === true) {
             violations.push({
-              ruleId: v.ruleId || 'UNKNOWN',
-              title: v.title || rule?.title || '',
-              line: v.line || 0,
-              severity: rule?.severity || 'MEDIUM',
-              description: v.description || '',
-              suggestion: v.suggestion || '',
-              confidence: v.confidence || 0.8,
-              category: rule?.category || 'general',
-              checkType: checkType,
+              ruleId: rule.ruleId,
+              title: violationData.title || rule.title || '',
+              line: violationData.line || 0,
+              severity: rule.severity || 'MEDIUM',
+              description: violationData.description || '',
+              suggestion: violationData.suggestion || '',
+              confidence: violationData.confidence || 0.8,
+              category: rule.category || 'general',
+              checkType: rule.checkType || item.type,
               source: 'code_checker_llm'
             });
+            logger.info(`[${fileName}] ⚠️ 위반 발견: ${rule.ruleId} (라인 ${violationData.line || '?'})`);
           }
         }
-      }
 
-    } catch (error) {
-      logger.warn(`[${fileName}] LLM 검증 실패: ${error.message}`);
-      // 폴백: 배치 검증
-      const fallbackViolations = await this.fallbackBatchVerification(sourceCode, llmCandidates);
-      violations.push(...fallbackViolations);
+        // API 부하 방지 딜레이
+        if (i < allItems.length - 1) {
+          await this._sleep(100);
+        }
+
+      } catch (error) {
+        logger.warn(`[${fileName}] 규칙 ${ruleNum} [${rule.ruleId}] LLM 실패: ${error.message}`);
+        this.filteringStats.llmCalls++;  // 실패해도 카운트
+      }
     }
 
+    logger.info(`[${fileName}] LLM 검증 완료: ${violations.length}개 위반 발견 (${this.filteringStats.llmCalls}회 호출)`);
     return violations;
   }
 
   /**
-   * 섹션별 통합 프롬프트 생성 (기존 guidelineChecker.js)
+   * 단일 규칙 검증용 프롬프트 생성
+   */
+  buildSingleRulePrompt(sourceCode, item) {
+    const rule = item.rule;
+    const type = item.type;
+
+    let ruleContext = '';
+
+    if (type === 'llm_with_regex' && item.candidates?.length > 0) {
+      const candidateLines = item.candidates
+        .map(c => `- 라인 ${c.line}: ${c.content}`)
+        .join('\n');
+      ruleContext = `
+**의심되는 위치 (정규식 매칭):**
+${candidateLines}
+
+위 위치들이 실제로 규칙을 위반하는지 검증하세요.`;
+    } else if (type === 'llm_with_ast') {
+      const checkPoints = (rule.checkPoints || []).map(cp => `- ${cp}`).join('\n');
+      ruleContext = `
+**AST 체크포인트:**
+${checkPoints || '- 규칙 준수 여부 확인'}
+
+위 체크포인트를 기준으로 검증하세요.`;
+    } else {
+      // llm_contextual
+      const keywords = (rule.keywords || []).join(', ');
+      ruleContext = `
+**관련 키워드:** ${keywords || '없음'}
+
+코드 전체를 분석하여 이 규칙의 위반 여부를 판단하세요.`;
+    }
+
+    return `다음 Java 코드가 주어진 규칙을 위반하는지 검사하세요.
+
+## 검사 대상 코드
+\`\`\`java
+${sourceCode}
+\`\`\`
+
+## 검사할 규칙
+- **규칙 ID:** ${rule.ruleId}
+- **제목:** ${rule.title}
+- **설명:** ${rule.description || '없음'}
+- **카테고리:** ${rule.category || 'general'}
+- **심각도:** ${rule.severity || 'MEDIUM'}
+${ruleContext}
+
+## 출력 형식 (JSON)
+\`\`\`json
+{
+  "violation": true 또는 false,
+  "line": 위반 라인 번호 (위반인 경우),
+  "title": "위반 제목",
+  "description": "구체적인 위반 내용",
+  "suggestion": "수정 제안",
+  "confidence": 0.0~1.0
+}
+\`\`\`
+
+## 판단 기준
+1. **확실한 위반만** true로 반환
+2. 애매하거나 불확실하면 false
+3. 위반이 아니면 간단히 {"violation": false} 반환
+
+JSON만 출력하세요.`;
+  }
+
+  /**
+   * 섹션별 통합 프롬프트 생성 (배치 처리용 - 현재 미사용)
    */
   buildSectionedPrompt(sourceCode, llmCandidates) {
     const truncatedCode = this.truncateCode(sourceCode, 3000);
