@@ -1,15 +1,22 @@
 /**
- * 가이드라인 추출기
+ * 가이드라인 추출기 V4.2 (기존 docx 파싱 로직 100% 복원)
  * 
- * docx 파일에서 코드 품질 규칙을 추출
+ * 핵심 기능:
+ * - DOCX 순서 보장 파싱 (preserveChildrenOrder + explicitChildren)
+ * - 목차 기반 섹션 분리 (_Toc anchor)
+ * - Bookmark 기반 정확한 섹션 추출
+ * - 테이블 → Markdown 변환
+ * - 이미지 관계 로드
+ * - Context vs Guideline 분류
  * 
  * @module extractor/guidelineExtractor
+ * @version 4.2
  */
 
 import fs from 'fs/promises';
 import path from 'path';
 import JSZip from 'jszip';
-import xml2js from 'xml2js';
+import { parseStringPromise } from 'xml2js';
 import { getLLMClient } from '../clients/llmClient.js';
 import { getQdrantClient } from '../clients/qdrantClient.js';
 import { getRuleTagger } from '../tagger/ruleTagger.js';
@@ -23,6 +30,13 @@ export class GuidelineExtractor {
     this.qdrantClient = null;
     this.ruleTagger = null;
     this.initialized = false;
+
+    // DOCX 파싱 상태
+    this.docxZip = null;
+    this.tableOfContents = new Map();
+    this.imageRelations = new Map();
+    this.guidelines = [];
+    this.contextRules = [];
   }
 
   /**
@@ -30,6 +44,8 @@ export class GuidelineExtractor {
    */
   async initialize() {
     if (this.initialized) return;
+
+    logger.info('🚀 가이드라인 추출기 V4.2 초기화 중...');
 
     this.llmClient = getLLMClient();
     await this.llmClient.initialize();
@@ -46,8 +62,6 @@ export class GuidelineExtractor {
 
   /**
    * 입력 디렉토리의 모든 docx 파일에서 룰 추출
-   * 
-   * @returns {Promise<Object>} 추출 결과
    */
   async extractAll() {
     const inputDir = config.paths.input.guidelines;
@@ -63,8 +77,8 @@ export class GuidelineExtractor {
     const allRules = [];
 
     for (const filePath of files) {
-      const rules = await this.extractFromFile(filePath);
-      allRules.push(...rules);
+      const result = await this.extractFromFile(filePath);
+      allRules.push(...result.guidelines);
     }
 
     logger.info(`총 ${allRules.length}개 룰 추출 완료`);
@@ -97,180 +111,591 @@ export class GuidelineExtractor {
   }
 
   /**
-   * 단일 docx 파일에서 룰 추출
-   * 
-   * @param {string} filePath - docx 파일 경로
-   * @returns {Promise<Object[]>} 추출된 룰 배열
+   * 단일 docx 파일에서 룰 추출 (V4.2 - 순서 보장)
    */
   async extractFromFile(filePath) {
-    logger.info(`파일 처리: ${path.basename(filePath)}`);
+    logger.info(`📄 파일 처리: ${path.basename(filePath)}`);
 
     try {
-      // docx → 텍스트 변환
-      const text = await this.parseDocx(filePath);
+      // 상태 초기화
+      this.tableOfContents = new Map();
+      this.imageRelations = new Map();
+      this.guidelines = [];
+      this.contextRules = [];
 
-      if (!text || text.length < 100) {
-        logger.warn(`텍스트 추출 실패 또는 내용 부족: ${filePath}`);
-        return [];
-      }
+      return await this.extractFromDOCX(filePath);
 
-      // 섹션 분리
-      const sections = this.splitIntoSections(text);
-      logger.info(`${sections.length}개 섹션 발견`);
+    } catch (error) {
+      logger.error(`❌ 파일 처리 실패: ${filePath}`, error.message);
+      return { contextRules: [], guidelines: [] };
+    }
+  }
 
-      // 각 섹션에서 룰 추출
-      const rules = [];
-      let ruleIndex = 1;
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DOCX 파싱 (V4.2 - 순서 보장)
+  // ═══════════════════════════════════════════════════════════════════════════
 
-      for (const section of sections) {
-        if (section.content.length < 50) continue;
+  async extractFromDOCX(docxPath) {
+    logger.info('📘 DOCX 파싱 시작 (V4.2 - 순서 보장)...');
 
-        const extractedRules = await this.extractRulesFromSection(section, ruleIndex);
-        rules.push(...extractedRules);
-        ruleIndex += extractedRules.length;
+    try {
+      // Step 1: ZIP 로드
+      const buffer = await fs.readFile(docxPath);
+      this.docxZip = await JSZip.loadAsync(buffer);
+
+      const documentXml = await this.docxZip.file('word/document.xml').async('string');
+
+      // 🔑 순서 보장 옵션 (기존 로직 100% 유지)
+      const doc = await parseStringPromise(documentXml, {
+        preserveChildrenOrder: true,
+        explicitChildren: true,
+        charsAsChildren: false
+      });
+
+      const body = doc['w:document']['w:body'][0];
+
+      // Step 2: 이미지 관계 로드
+      await this.loadImageRelations();
+
+      // Step 3: 목차 파싱
+      logger.info('\n📋 Step 1/3: 목차 파싱 중...');
+      this.parseTableOfContents(body);
+      logger.info(`✅ 목차 ${this.tableOfContents.size}개 항목 파싱 완료`);
+
+      // Step 4: Bookmark 기반 섹션 추출 (순서 보장)
+      logger.info('\n📑 Step 2/3: Bookmark 기반 섹션 추출 중...');
+      const sections = await this.extractSectionsByBookmarks(body);
+      logger.info(`✅ 총 ${sections.length}개 섹션 추출 완료`);
+
+      // 테이블 통계
+      const sectionsWithTables = sections.filter(s =>
+        s.contentElements.some(e => e.type === 'table')
+      );
+      const totalTables = sections.reduce((sum, s) =>
+        sum + s.contentElements.filter(e => e.type === 'table').length, 0
+      );
+      logger.info(`📊 테이블이 있는 섹션: ${sectionsWithTables.length}개, 총 테이블: ${totalTables}개`);
+
+      // Step 5: Context vs Guidelines 분류
+      const contextSections = sections.filter(s => s.isContext);
+      const guidelineSections = sections.filter(s => !s.isContext);
+
+      logger.info(`  📋 Context Rules: ${contextSections.length}개`);
+      logger.info(`  📜 Guidelines: ${guidelineSections.length}개`);
+
+      // Step 6: Context Rules 처리
+      this.contextRules = contextSections.map(ctx => ({
+        ruleId: `ctx.${ctx.contextType}`,
+        title: ctx.title,
+        sectionNumber: ctx.sectionNumber,
+        level: ctx.level,
+        content: this.extractSectionTextOnly(ctx),
+        appliesTo: ctx.appliesTo,
+        contextType: ctx.contextType
+      }));
+
+      // Step 7: Guideline 처리 (LLM 배치)
+      logger.info('\n📦 Step 3/3: Guideline 구조화 중...');
+      this.guidelines = [];
+      const batchSize = 5;
+
+      for (let i = 0; i < guidelineSections.length; i += batchSize) {
+        const batch = guidelineSections.slice(i, i + batchSize);
+        const batchNum = Math.floor(i / batchSize) + 1;
+        const totalBatches = Math.ceil(guidelineSections.length / batchSize);
+
+        logger.info(`  📦 배치 ${batchNum}/${totalBatches} 처리 중...`);
+
+        await Promise.all(batch.map(section => this.convertToGuideline(section)));
 
         // API 부하 방지
         await this._sleep(200);
       }
 
-      logger.info(`${rules.length}개 룰 추출: ${path.basename(filePath)}`);
-      return rules;
+      this.sortGuidelines();
+
+      logger.info(`\n✅ 총 ${this.contextRules.length}개 Context + ${this.guidelines.length}개 Guideline 추출 완료`);
+
+      return {
+        contextRules: this.contextRules,
+        guidelines: this.guidelines
+      };
 
     } catch (error) {
-      logger.error(`파일 처리 실패: ${filePath}`, error.message);
-      return [];
+      logger.error(`❌ DOCX 파싱 실패: ${error.message}`);
+      throw error;
     }
   }
 
   /**
-   * docx 파일 파싱 (jszip + xml2js)
+   * 이미지 관계 로드
    */
-  async parseDocx(filePath) {
-    const buffer = await fs.readFile(filePath);
-    const zip = await JSZip.loadAsync(buffer);
-    
-    // word/document.xml 추출
-    const documentXml = await zip.file('word/document.xml')?.async('string');
-    if (!documentXml) {
-      throw new Error('document.xml not found in docx');
-    }
-    
-    // XML 파싱
-    const parser = new xml2js.Parser({ explicitArray: false });
-    const result = await parser.parseStringPromise(documentXml);
-    
-    // 텍스트 추출
-    const body = result['w:document']?.['w:body'];
-    if (!body) {
-      throw new Error('Invalid docx structure');
-    }
-    
-    return this.extractTextFromBody(body);
-  }
+  async loadImageRelations() {
+    try {
+      const relsXml = await this.docxZip.file('word/_rels/document.xml.rels').async('string');
+      const rels = await parseStringPromise(relsXml);
 
-  /**
-   * docx body에서 텍스트 추출
-   */
-  extractTextFromBody(body) {
-    const texts = [];
-    const paragraphs = body['w:p'];
-    
-    if (!paragraphs) return '';
-    
-    const paraArray = Array.isArray(paragraphs) ? paragraphs : [paragraphs];
-    
-    for (const para of paraArray) {
-      const paraText = this.extractTextFromParagraph(para);
-      if (paraText) {
-        texts.push(paraText);
-      }
-    }
-    
-    return texts.join('\n');
-  }
+      const relationships = rels['Relationships']['Relationship'];
+      for (const rel of relationships) {
+        const id = rel.$['Id'];
+        const target = rel.$['Target'];
+        const type = rel.$['Type'];
 
-  /**
-   * 단일 문단에서 텍스트 추출
-   */
-  extractTextFromParagraph(para) {
-    if (!para) return '';
-    
-    const runs = para['w:r'];
-    if (!runs) return '';
-    
-    const runArray = Array.isArray(runs) ? runs : [runs];
-    const textParts = [];
-    
-    for (const run of runArray) {
-      const textNode = run['w:t'];
-      if (textNode) {
-        // textNode가 객체인 경우 (속성이 있는 경우)
-        const text = typeof textNode === 'string' ? textNode : textNode._ || textNode;
-        if (text) {
-          textParts.push(text);
+        if (type && type.includes('image')) {
+          this.imageRelations.set(id, target);
         }
       }
+
+      logger.info(`✅ 이미지 관계 ${this.imageRelations.size}개 로드 완료`);
+    } catch (error) {
+      logger.warn('⚠️ 이미지 관계 파일 없음');
     }
-    
-    return textParts.join('');
   }
 
-  /**
-   * 텍스트를 섹션으로 분리
-   */
-  splitIntoSections(text) {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 목차 파싱 ($$ 구조 대응)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  parseTableOfContents(body) {
+    let tocStarted = false;
+    let tocEnded = false;
+
+    const children = body.$$ || [];
+
+    for (const child of children) {
+      if (tocEnded) break;
+
+      const tagName = child['#name'];
+      if (tagName !== 'w:p') continue;
+
+      const hyperlinks = this.findChildrenByName(child, 'w:hyperlink');
+
+      if (hyperlinks.length === 0) {
+        if (tocStarted) {
+          const bookmarks = this.findBookmarkStarts(child);
+          if (bookmarks.length > 0) {
+            tocEnded = true;
+            break;
+          }
+        }
+        continue;
+      }
+
+      for (const hyperlink of hyperlinks) {
+        const anchor = hyperlink.$?.['w:anchor'];
+        if (!anchor) continue;
+
+        if (anchor.startsWith('_Toc')) {
+          tocStarted = true;
+        }
+
+        if (!tocStarted) continue;
+
+        const pPr = this.findChildByName(child, 'w:pPr');
+        const pStyleNode = pPr ? this.findChildByName(pPr, 'w:pStyle') : null;
+        const pStyle = pStyleNode?.$?.['w:val'];
+
+        let level = null;
+        if (pStyle === '12') level = 1;
+        else if (pStyle === '21') level = 2;
+        else if (pStyle === '31') level = 3;
+        else if (pStyle === '41') level = 4;
+
+        if (level === null) continue;
+
+        const title = this.extractTextFromElement(hyperlink);
+
+        this.tableOfContents.set(anchor, {
+          level,
+          title: title.trim(),
+          anchor
+        });
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Bookmark 기반 섹션 추출 (순서 보장)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  async extractSectionsByBookmarks(body) {
     const sections = [];
-    
-    // 섹션 헤더 패턴 (예: "1.2.3 제목", "제1장", "### 제목" 등)
-    const sectionPattern = /(?:^|\n)((?:\d+\.)+\d*\s+[^\n]+|제\d+[장절항]\s*[^\n]*|#{1,3}\s+[^\n]+)/g;
-    
-    let lastIndex = 0;
-    let lastHeader = '서문';
-    let match;
+    let currentSection = null;
+    let skipUntilTocEnd = true;
 
-    while ((match = sectionPattern.exec(text)) !== null) {
-      // 이전 섹션 저장
-      if (lastIndex > 0 || match.index > 0) {
-        const content = text.substring(lastIndex, match.index).trim();
-        if (content.length > 50) {
-          sections.push({
-            header: lastHeader,
-            content: content
-          });
+    const orderedElements = this.getOrderedBodyElements(body);
+
+    logger.info(`📋 순서 보장 요소: ${orderedElements.length}개`);
+
+    for (const { type, element } of orderedElements) {
+      if (type === 'w:p') {
+        const bookmarkStarts = this.findBookmarkStarts(element);
+
+        for (const bookmark of bookmarkStarts) {
+          const bookmarkName = bookmark.$?.['w:name'];
+          if (!bookmarkName) continue;
+
+          const tocEntry = this.tableOfContents.get(bookmarkName);
+          if (tocEntry) {
+            skipUntilTocEnd = false;
+
+            if (currentSection && this.isValidSection(currentSection)) {
+              sections.push(currentSection);
+            }
+
+            currentSection = {
+              level: tocEntry.level,
+              sectionNumber: this.inferSectionNumber(tocEntry.title),
+              title: tocEntry.title,
+              anchor: bookmarkName,
+              contentElements: [],
+              isContext: false,
+              contextType: null,
+              appliesTo: null
+            };
+
+            const contextInfo = this.identifyContextSection(currentSection);
+            if (contextInfo) {
+              currentSection.isContext = true;
+              currentSection.contextType = contextInfo.contextType;
+              currentSection.appliesTo = contextInfo.appliesTo;
+            }
+          }
+        }
+
+        if (skipUntilTocEnd) continue;
+
+        if (currentSection && bookmarkStarts.length === 0) {
+          currentSection.contentElements.push({ type: 'paragraph', element });
         }
       }
 
-      lastHeader = match[1].trim();
-      lastIndex = match.index + match[0].length;
+      else if (type === 'w:tbl') {
+        if (skipUntilTocEnd) continue;
+
+        if (currentSection) {
+          currentSection.contentElements.push({ type: 'table', element });
+
+          const tblInfo = this.extractTableData(element);
+          logger.debug(`  📊 테이블 → "${currentSection.title.substring(0, 30)}" (${tblInfo.rows}×${tblInfo.cols})`);
+        }
+      }
     }
 
-    // 마지막 섹션
-    const lastContent = text.substring(lastIndex).trim();
-    if (lastContent.length > 50) {
-      sections.push({
-        header: lastHeader,
-        content: lastContent
-      });
-    }
-
-    // 섹션이 없으면 전체를 하나의 섹션으로
-    if (sections.length === 0 && text.length > 100) {
-      sections.push({
-        header: '전체 문서',
-        content: text
-      });
+    if (currentSection && this.isValidSection(currentSection)) {
+      sections.push(currentSection);
     }
 
     return sections;
   }
 
   /**
-   * 섹션에서 룰 추출 (LLM 사용)
+   * 순서 보장된 body 요소 추출
    */
-  async extractRulesFromSection(section, startIndex) {
-    const prompt = this.buildExtractionPrompt(section);
+  getOrderedBodyElements(body) {
+    const elements = [];
 
+    // $$ 구조 우선 사용 (순서 보장)
+    if (body.$$) {
+      for (const child of body.$$) {
+        const tagName = child['#name'];
+        if (tagName === 'w:p' || tagName === 'w:tbl') {
+          elements.push({ type: tagName, element: child });
+        }
+      }
+      logger.debug(`✅ 순서 보장 파싱: ${elements.length}개 요소`);
+      return elements;
+    }
+
+    // 폴백: 키 기반 추출 (순서 보장 불가)
+    logger.warn('⚠️ body.$$ 없음 - 순서 보장 불가!');
+
+    for (const [key, value] of Object.entries(body)) {
+      if ((key === 'w:p' || key === 'w:tbl') && Array.isArray(value)) {
+        for (const element of value) {
+          elements.push({ type: key, element });
+        }
+      }
+    }
+
+    return elements;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // XML 헬퍼 메소드
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  findBookmarkStarts(element) {
+    const bookmarks = [];
+
+    if (element.$$) {
+      for (const child of element.$$) {
+        if (child['#name'] === 'w:bookmarkStart') {
+          bookmarks.push(child);
+        }
+      }
+    }
+
+    if (bookmarks.length === 0 && element['w:bookmarkStart']) {
+      bookmarks.push(...element['w:bookmarkStart']);
+    }
+
+    return bookmarks;
+  }
+
+  findChildrenByName(element, name) {
+    const children = [];
+
+    if (element.$$) {
+      for (const child of element.$$) {
+        if (child['#name'] === name) {
+          children.push(child);
+        }
+      }
+    }
+
+    if (children.length === 0 && element[name]) {
+      if (Array.isArray(element[name])) {
+        children.push(...element[name]);
+      } else {
+        children.push(element[name]);
+      }
+    }
+
+    return children;
+  }
+
+  findChildByName(element, name) {
+    if (element.$$) {
+      for (const child of element.$$) {
+        if (child['#name'] === name) {
+          return child;
+        }
+      }
+    }
+
+    if (element[name]) {
+      return Array.isArray(element[name]) ? element[name][0] : element[name];
+    }
+
+    return null;
+  }
+
+  /**
+   * 재귀적 텍스트 추출 (기존 로직 100%)
+   */
+  extractTextFromElement(element) {
+    const texts = [];
+
+    const extractRecursive = (el) => {
+      if (el['#name'] === 'w:t') {
+        if (el._) {
+          texts.push(el._);
+        }
+      }
+
+      if (el.$$) {
+        for (const child of el.$$) {
+          extractRecursive(child);
+        }
+      }
+    };
+
+    extractRecursive(element);
+
+    // 폴백: $$ 없는 경우
+    if (texts.length === 0) {
+      const runs = element['w:r'] || [];
+      for (const run of runs) {
+        const tElements = run['w:t'];
+        if (!tElements) continue;
+        for (const t of tElements) {
+          if (typeof t === 'string') texts.push(t);
+          else if (t && t._) texts.push(t._);
+        }
+      }
+    }
+
+    return texts.join('');
+  }
+
+  extractTextFromParagraph(para) {
+    return this.extractTextFromElement(para);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 섹션 처리
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  inferSectionNumber(title) {
+    const match = title.match(/^([\d.]+)\s+/);
+    return match ? match[1] : '0';
+  }
+
+  identifyContextSection(section) {
+    const keywords = ['개요', 'Consensus', '대상', '용어', '아키텍처'];
+    const lowerTitle = section.title.toLowerCase();
+
+    const hasKeyword = keywords.some(kw => lowerTitle.includes(kw.toLowerCase()));
+    if (!hasKeyword) return null;
+
+    let contextType = 'general';
+    if (lowerTitle.includes('개요')) contextType = 'overview';
+    else if (lowerTitle.includes('consensus')) contextType = 'consensus';
+    else if (lowerTitle.includes('대상')) contextType = 'scope';
+    else if (lowerTitle.includes('용어')) contextType = 'terminology';
+    else if (lowerTitle.includes('아키텍처')) contextType = 'architecture';
+
+    let appliesTo = 'all';
+    if (section.level === 2) {
+      const l1Number = section.sectionNumber.split('.')[0];
+      appliesTo = `section_${l1Number}`;
+    }
+
+    return { contextType, appliesTo };
+  }
+
+  isValidSection(section) {
+    if (section.isContext) return true;
+    if (section.contentElements.length === 0) return false;
+    return true;
+  }
+
+  extractSectionTextOnly(section) {
+    const textLines = [];
+
+    for (const item of section.contentElements) {
+      if (item.type === 'paragraph') {
+        const text = this.extractTextFromParagraph(item.element);
+        if (text) textLines.push(text);
+      }
+    }
+
+    return textLines.join('\n');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 테이블 처리
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  extractTableData(tableElement) {
+    let rows = this.findChildrenByName(tableElement, 'w:tr');
+
+    if (rows.length === 0) {
+      return { type: 'empty', content: '', markdown: '', rows: 0, cols: 0 };
+    }
+
+    const tableData = [];
+
+    for (const row of rows) {
+      const cells = this.findChildrenByName(row, 'w:tc');
+      const rowData = [];
+
+      for (const cell of cells) {
+        const cellParas = this.findChildrenByName(cell, 'w:p');
+        const cellTexts = [];
+
+        for (const para of cellParas) {
+          const text = this.extractTextFromParagraph(para);
+          if (text) cellTexts.push(text);
+        }
+
+        rowData.push({
+          text: cellTexts.join(' '),
+          gridSpan: 1,
+          vMerge: null
+        });
+      }
+
+      tableData.push(rowData);
+    }
+
+    // 단일 셀 → 텍스트박스로 처리
+    if (tableData.length === 1 && tableData[0].length === 1) {
+      return {
+        type: 'textbox',
+        content: tableData[0][0].text,
+        markdown: '',
+        rows: 1,
+        cols: 1
+      };
+    }
+
+    const markdown = this.convertTableToMarkdown(tableData);
+
+    return {
+      type: 'table',
+      rows: tableData.length,
+      cols: tableData[0]?.length || 0,
+      content: '',
+      markdown
+    };
+  }
+
+  convertTableToMarkdown(tableData) {
+    if (tableData.length === 0) return '';
+
+    const lines = [];
+
+    const headerRow = tableData[0];
+    const headerCells = headerRow.map(cell => cell.text || '');
+    lines.push('| ' + headerCells.join(' | ') + ' |');
+
+    const separator = headerCells.map(() => '---').join(' | ');
+    lines.push('| ' + separator + ' |');
+
+    for (let i = 1; i < tableData.length; i++) {
+      const row = tableData[i];
+      const cells = row.map(cell => cell.text || '');
+      lines.push('| ' + cells.join(' | ') + ' |');
+    }
+
+    return lines.join('\n');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Guideline 변환 (LLM 활용)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  async extractSectionContent(section) {
+    const content = {
+      text: '',
+      tables: [],
+      images: []
+    };
+
+    const textLines = [];
+
+    for (const item of section.contentElements) {
+      if (item.type === 'paragraph') {
+        const text = this.extractTextFromParagraph(item.element);
+        if (text) textLines.push(text);
+      }
+
+      else if (item.type === 'table') {
+        const table = this.extractTableData(item.element);
+        content.tables.push(table);
+
+        if (table.type === 'textbox') {
+          textLines.push(`\n[텍스트박스] ${table.content}\n`);
+        } else {
+          textLines.push('\n' + table.markdown + '\n');
+        }
+      }
+    }
+
+    content.text = textLines.join('\n');
+
+    return content;
+  }
+
+  async convertToGuideline(section) {
     try {
+      const content = await this.extractSectionContent(section);
+      const ruleText = `${section.sectionNumber} ${section.title}\n\n${content.text}`;
+
+      const prompt = this.buildExtractionPrompt(section, content);
+
       const response = await this.llmClient.generateCompletion(prompt, {
         temperature: 0.1,
         max_tokens: 2000,
@@ -279,48 +704,46 @@ export class GuidelineExtractor {
 
       const result = this.llmClient.cleanAndExtractJSON(response);
 
-      if (!result || !Array.isArray(result.rules)) {
-        logger.warn(`룰 추출 실패 (JSON): ${section.header}`);
-        return [];
+      if (!result) {
+        const guideline = this.createFallbackGuideline(section, content, ruleText);
+        this.guidelines.push(guideline);
+        return;
       }
 
-      // 룰 ID 생성 및 정규화
-      return result.rules.map((rule, idx) => this.normalizeRule(rule, startIndex + idx, section.header));
+      const guideline = this.normalizeGuideline(result, section, content, ruleText);
+      this.guidelines.push(guideline);
+
+      logger.debug(`  ✅ [${guideline.ruleId}] 변환 완료`);
 
     } catch (error) {
-      logger.error(`섹션 처리 실패: ${section.header}`, error.message);
-      return [];
+      logger.error(`  ❌ 변환 실패: ${section.sectionNumber} - ${error.message}`);
+      const guideline = this.createFallbackGuideline(section, { text: '', tables: [], images: [] }, '');
+      this.guidelines.push(guideline);
     }
   }
 
-  /**
-   * 추출 프롬프트 생성
-   * 
-   * 코드 예시가 있는 경우 함께 추출 (RuleTagger에서 패턴 생성에 활용)
-   */
-  buildExtractionPrompt(section) {
+  buildExtractionPrompt(section, content) {
     return `다음 개발 가이드라인 섹션에서 코드 품질 규칙을 추출해주세요.
 
-## 섹션 제목
-${section.header}
+## 섹션 정보
+- 번호: ${section.sectionNumber}
+- 제목: ${section.title}
+- 레벨: ${section.level}
 
 ## 섹션 내용
-${section.content.substring(0, 4000)}
+${content.text.substring(0, 4000)}
 
 ## 출력 형식 (JSON)
 {
-  "rules": [
-    {
-      "title": "규칙 제목 (간결하게)",
-      "description": "규칙 설명 (상세하게)",
-      "category": "카테고리 (resource_management, security, exception_handling, performance, architecture, code_style 중 택1)",
-      "severity": "심각도 (CRITICAL, HIGH, MEDIUM, LOW 중 택1)",
-      "message": "위반 시 표시할 메시지",
-      "suggestion": "개선 제안",
-      "badExample": "문서에 있는 나쁜 코드 예시 (있는 경우만, 원문 그대로)",
-      "goodExample": "문서에 있는 좋은 코드 예시 (있는 경우만, 원문 그대로)"
-    }
-  ]
+  "title": "규칙 제목 (간결하게)",
+  "description": "규칙 설명 (상세하게)",
+  "category": "카테고리 (resource_management, security, exception_handling, performance, architecture, code_style 중 택1)",
+  "severity": "심각도 (CRITICAL, HIGH, MEDIUM, LOW 중 택1)",
+  "message": "위반 시 표시할 메시지",
+  "suggestion": "개선 제안",
+  "badExample": "문서에 있는 나쁜 코드 예시 (있는 경우만, 원문 그대로)",
+  "goodExample": "문서에 있는 좋은 코드 예시 (있는 경우만, 원문 그대로)",
+  "keywords": ["관련", "키워드", "목록"]
 }
 
 ## 추출 기준
@@ -334,37 +757,28 @@ ${section.content.substring(0, 4000)}
 - 문서에 코드 예시가 있으면 반드시 추출하세요
 - badExample: 피해야 할 코드, 잘못된 코드, 안티패턴
 - goodExample: 권장하는 코드, 올바른 코드, 개선된 코드
-- 코드 블록, 인라인 코드, 예시 코드 모두 해당
-- 코드가 없으면 해당 필드를 생략하거나 null
 
-규칙이 없으면 빈 배열을 반환하세요.
 JSON만 출력하세요.`;
   }
 
-  /**
-   * 추출된 룰 정규화
-   * 
-   * 코드 예시가 있는 경우 problematicCode/fixedCode로 매핑
-   * → RuleTagger가 패턴 추출에 활용
-   */
-  normalizeRule(rule, index, source) {
+  normalizeGuideline(result, section, content, ruleText) {
     // 카테고리 정규화
     const validCategories = [
       'resource_management', 'security', 'exception_handling',
       'performance', 'architecture', 'code_style', 'naming_convention',
       'documentation', 'general'
     ];
-    const category = validCategories.includes(rule.category?.toLowerCase())
-      ? rule.category.toLowerCase()
-      : 'general';
+    const category = validCategories.includes(result.category?.toLowerCase())
+      ? result.category.toLowerCase()
+      : this.inferCategory(section.title, ruleText);
 
     // 심각도 정규화
     const validSeverities = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
-    const severity = validSeverities.includes(rule.severity?.toUpperCase())
-      ? rule.severity.toUpperCase()
-      : 'MEDIUM';
+    const severity = validSeverities.includes(result.severity?.toUpperCase())
+      ? result.severity.toUpperCase()
+      : this.inferSeverity(section.title, ruleText);
 
-    // 카테고리 접두사 생성
+    // 카테고리 접두사
     const categoryPrefix = {
       'resource_management': 'RES',
       'security': 'SEC',
@@ -378,37 +792,145 @@ JSON만 출력하세요.`;
     };
 
     const prefix = categoryPrefix[category] || 'GEN';
-    const ruleId = `${prefix}-${String(index).padStart(3, '0')}`;
-
-    // 코드 예시 매핑 (있는 경우만)
-    // badExample → problematicCode, goodExample → fixedCode
-    // RuleTagger가 이 필드를 보고 패턴 추출
-    const hasCodeExamples = rule.badExample || rule.goodExample;
-    
-    if (hasCodeExamples) {
-      logger.debug(`  📝 [${ruleId}] 코드 예시 발견 → 패턴 추출에 활용`);
-    }
+    const ruleId = `${prefix}.${section.sectionNumber.replace(/\./g, '_')}`;
 
     return {
       ruleId,
-      title: rule.title || '제목 없음',
-      description: rule.description || '',
+      sectionNumber: section.sectionNumber,
+      title: result.title || section.title,
+      level: section.level,
       category,
       severity,
-      message: rule.message || rule.title || '',
-      suggestion: rule.suggestion || '',
-      source: `guideline:${source}`,
+      description: result.description || ruleText.substring(0, 500),
+      message: result.message || result.title || section.title,
+      suggestion: result.suggestion || '',
+      source: `guideline:${section.sectionNumber}`,
       isActive: true,
       // 코드 예시 (RuleTagger에서 활용)
-      problematicCode: rule.badExample || null,
-      fixedCode: rule.goodExample || null
+      problematicCode: result.badExample || null,
+      fixedCode: result.goodExample || null,
+      keywords: result.keywords || this.extractKeywordsFromText(section.title, ruleText),
+      // 문서 컨텍스트
+      hasTables: content.tables.length > 0,
+      hasImages: content.images?.length > 0,
+      tables: content.tables,
+      metadata: {
+        createdAt: new Date().toISOString(),
+        source: `${section.sectionNumber} ${section.title}`,
+        version: '4.2'
+      }
     };
   }
 
-  /**
-   * sleep 유틸리티
-   * @private
-   */
+  createFallbackGuideline(section, content, ruleText) {
+    const category = this.inferCategory(section.title, ruleText || '');
+
+    const categoryPrefix = {
+      'resource_management': 'RES',
+      'security': 'SEC',
+      'exception_handling': 'ERR',
+      'performance': 'PERF',
+      'architecture': 'ARCH',
+      'code_style': 'STY',
+      'naming_convention': 'NAM',
+      'documentation': 'DOC',
+      'general': 'GEN'
+    };
+
+    const prefix = categoryPrefix[category] || 'GEN';
+    const ruleId = `${prefix}.${section.sectionNumber.replace(/\./g, '_')}`;
+
+    return {
+      ruleId,
+      sectionNumber: section.sectionNumber,
+      title: section.title,
+      level: section.level,
+      category,
+      severity: this.inferSeverity(section.title, ruleText || ''),
+      description: ruleText?.substring(0, 500) || section.title,
+      message: `${section.title} 규칙을 위반했습니다`,
+      source: `guideline:${section.sectionNumber}`,
+      isActive: true,
+      keywords: this.extractKeywordsFromText(section.title, ruleText || ''),
+      metadata: {
+        createdAt: new Date().toISOString(),
+        source: `${section.sectionNumber} ${section.title}`,
+        version: '4.2',
+        isFallback: true
+      },
+      hasTables: content.tables?.length > 0,
+      tables: content.tables || []
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 유틸리티
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  inferCategory(title, content) {
+    const lowerTitle = title.toLowerCase();
+    const lowerContent = content.toLowerCase();
+
+    if (lowerTitle.includes('명명') || lowerTitle.includes('이름')) return 'naming_convention';
+    if (lowerTitle.includes('주석') || lowerContent.includes('javadoc')) return 'documentation';
+    if (lowerTitle.includes('들여쓰기') || lowerTitle.includes('공백')) return 'code_style';
+    if (lowerContent.includes('exception') || lowerContent.includes('try') || lowerContent.includes('catch')) return 'exception_handling';
+    if (lowerContent.includes('connection') || lowerContent.includes('resource') || lowerContent.includes('close')) return 'resource_management';
+    if (lowerContent.includes('security') || lowerContent.includes('injection') || lowerContent.includes('sql')) return 'security';
+    if (lowerContent.includes('controller') || lowerContent.includes('service') || lowerContent.includes('layer')) return 'architecture';
+    if (lowerContent.includes('performance') || lowerContent.includes('성능')) return 'performance';
+
+    return 'general';
+  }
+
+  inferSeverity(title, content) {
+    const lowerContent = content.toLowerCase();
+
+    if (lowerContent.includes('필수') || lowerContent.includes('반드시') || lowerContent.includes('금지')) return 'HIGH';
+    if (lowerContent.includes('보안') || lowerContent.includes('security') || lowerContent.includes('injection')) return 'CRITICAL';
+    if (lowerContent.includes('권장') || lowerContent.includes('가급적')) return 'MEDIUM';
+
+    return 'LOW';
+  }
+
+  extractKeywordsFromText(title, content) {
+    const keywords = [];
+    const text = `${title} ${content}`.toLowerCase();
+
+    // Java 관련 키워드
+    const javaKeywords = [
+      'exception', 'try', 'catch', 'finally', 'throw',
+      'connection', 'stream', 'resource', 'close',
+      'sql', 'injection', 'security', 'validation',
+      'controller', 'service', 'repository', 'dao',
+      'annotation', 'interface', 'abstract', 'class',
+      'static', 'final', 'synchronized', 'volatile'
+    ];
+
+    for (const kw of javaKeywords) {
+      if (text.includes(kw)) {
+        keywords.push(kw);
+      }
+    }
+
+    return keywords;
+  }
+
+  sortGuidelines() {
+    this.guidelines.sort((a, b) => {
+      const parseSection = (s) => s.split('.').map(n => parseInt(n, 10) || 0);
+      const aParts = parseSection(a.sectionNumber);
+      const bParts = parseSection(b.sectionNumber);
+
+      for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
+        const aVal = aParts[i] || 0;
+        const bVal = bParts[i] || 0;
+        if (aVal !== bVal) return aVal - bVal;
+      }
+      return 0;
+    });
+  }
+
   _sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
