@@ -8,7 +8,9 @@
     "start": "node src/main.js",
     "extract-guidelines": "node src/main.js extract-guidelines",
     "extract-issues": "node src/main.js extract-issues",
+    "sync-qdrant": "node src/main.js sync-qdrant",
     "check": "node src/main.js check",
+    "clear-rules": "node src/main.js clear-rules",
     "help": "node src/main.js help"
   },
   "dependencies": {

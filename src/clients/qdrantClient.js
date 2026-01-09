@@ -193,6 +193,111 @@ export class QdrantClient {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
+  // 컬렉션 리셋 및 JSON 임포트 (sync-rules 명령어용)
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /**
+   * 컬렉션 초기화 (삭제 후 재생성)
+   * sync-rules --reset 옵션에서 사용
+   */
+  async resetCollection() {
+    logger.info(`🔄 ${this.collectionName} 컬렉션 초기화 중...`);
+    
+    try {
+      const exists = await this.collectionExists(this.collectionName);
+      
+      if (exists) {
+        // 기존 컬렉션 삭제
+        await this.client.deleteCollection(this.collectionName);
+        logger.info(`🗑️ 기존 ${this.collectionName} 컬렉션 삭제 완료`);
+      }
+      
+      // 새 컬렉션 생성
+      await this.client.createCollection(this.collectionName, {
+        vectors: {
+          size: this.vectorDimensions,
+          distance: 'Cosine',
+          hnsw_config: {
+            m: 16,
+            ef_construct: 100
+          }
+        },
+        optimizers_config: {
+          default_segment_number: 2
+        },
+        replication_factor: 1
+      });
+      
+      // 인덱스 생성
+      await this._createPayloadIndices();
+      
+      logger.info(`✅ ${this.collectionName} 컬렉션 초기화 완료`);
+      return true;
+    } catch (error) {
+      logger.error('❌ 컬렉션 초기화 실패:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * JSON 파일들에서 룰 임포트
+   * @param {string[]} jsonPaths - JSON 파일 경로 배열
+   * @returns {Promise<{total: number, success: number, failed: number}>}
+   */
+  async importFromJsonFiles(jsonPaths) {
+    const stats = { total: 0, success: 0, failed: 0 };
+    
+    for (const jsonPath of jsonPaths) {
+      try {
+        const fs = await import('fs/promises');
+        const content = await fs.readFile(jsonPath, 'utf-8');
+        const data = JSON.parse(content);
+        
+        // 통일 스키마: { metadata: {...}, rules: [...] }
+        const rules = data.rules || [];
+        const source = data.metadata?.source || 'unknown';
+        
+        logger.info(`📥 ${jsonPath} 로드 중... (${rules.length}개 룰)`);
+        
+        for (const rule of rules) {
+          stats.total++;
+          try {
+            await this.storeRule(rule);
+            stats.success++;
+          } catch (error) {
+            stats.failed++;
+            logger.warn(`  ⚠️ 룰 저장 실패 (${rule.ruleId}): ${error.message}`);
+          }
+        }
+        
+        logger.info(`  ✅ ${source} 임포트 완료: ${rules.length}개`);
+      } catch (error) {
+        logger.error(`❌ JSON 파일 로드 실패 (${jsonPath}): ${error.message}`);
+      }
+    }
+    
+    return stats;
+  }
+
+  /**
+   * 컬렉션 통계 조회
+   */
+  async getCollectionStats() {
+    try {
+      const info = await this.client.getCollection(this.collectionName);
+      return {
+        name: this.collectionName,
+        pointsCount: info.points_count || 0,
+        vectorsCount: info.vectors_count || 0,
+        status: info.status
+      };
+    } catch (error) {
+      logger.error('컬렉션 통계 조회 실패:', error.message);
+      return null;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
   // 벡터/유틸리티 메서드 (기존 qdrantAdapter.js 로직)
   // ═══════════════════════════════════════════════════════════════════════════════
 

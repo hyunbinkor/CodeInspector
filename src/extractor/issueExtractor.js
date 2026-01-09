@@ -1,13 +1,13 @@
 /**
  * 이슈 추출기
  * 
- * CSV 파일 → Issue 파싱 → Rule 변환 → RuleTagger(LLM 태깅) → Qdrant
+ * CSV 파일 → Issue 파싱 → Rule 변환 → RuleTagger(LLM 태깅) → JSON 저장
  * 
  * GuidelineExtractor와 동일한 흐름:
  * 1. 원본 파싱 (CSV → Issue JSON)
  * 2. 기본 Rule로 변환 (필드 매핑)
  * 3. RuleTagger로 태깅 (LLM 기반)
- * 4. Qdrant 저장
+ * 4. JSON 저장
  * 
  * @module extractor/issueExtractor
  */
@@ -16,7 +16,6 @@ import fs from 'fs/promises';
 import path from 'path';
 import { parse as csvParse } from 'csv-parse/sync';
 import { getLLMClient } from '../clients/llmClient.js';
-import { getQdrantClient } from '../clients/qdrantClient.js';
 import { getRuleTagger } from '../tagger/ruleTagger.js';
 import { writeJsonFile, listFiles } from '../utils/fileUtils.js';
 import { config } from '../config/config.js';
@@ -71,7 +70,6 @@ const CATEGORY_NORMALIZE_MAP = {
 export class IssueExtractor {
   constructor() {
     this.llmClient = null;
-    this.qdrantClient = null;
     this.ruleTagger = null;
     this.initialized = false;
     
@@ -87,9 +85,6 @@ export class IssueExtractor {
 
     this.llmClient = getLLMClient();
     await this.llmClient.initialize();
-
-    this.qdrantClient = getQdrantClient();
-    await this.qdrantClient.initialize();
 
     // GuidelineExtractor와 동일하게 RuleTagger 사용
     this.ruleTagger = getRuleTagger();
@@ -352,17 +347,6 @@ export class IssueExtractor {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Rule 배열을 Qdrant에 저장
-   */
-  async storeRules(rules) {
-    logger.info(`💾 Qdrant 저장: ${rules.length}개 룰`);
-    
-    const count = await this.qdrantClient.storeRules(rules);
-    
-    logger.info(`   저장 완료: ${count}개`);
-    return count;
-  }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // 메인 API
   // ═══════════════════════════════════════════════════════════════════════════
@@ -374,7 +358,7 @@ export class IssueExtractor {
    * 1. CSV 파싱 → Issue JSON
    * 2. Issue → 기본 Rule 변환
    * 3. RuleTagger로 태깅 (LLM 기반)
-   * 4. Qdrant 저장
+   * 4. JSON 저장
    */
   async extractAll() {
     const inputDir = config.paths.input.issues;
@@ -404,41 +388,25 @@ export class IssueExtractor {
     logger.info('룰 태깅 시작...');
     const taggedRules = await this.tagRules(allRules);
 
-    // Stage 4: Qdrant 저장
-    logger.info('Qdrant 저장 시작...');
-    await this.storeRules(taggedRules);
-
-    // 백업 JSON 저장 - Issues (중간 결과)
-    const issuesOutputPath = path.join(
-      config.paths.output.rules,
-      `issues_parsed_${Date.now()}.json`
-    );
-    await writeJsonFile(issuesOutputPath, {
-      parsedAt: new Date().toISOString(),
-      source: 'csv',
-      count: allIssues.length,
-      issues: allIssues
-    });
-    logger.info(`📄 Issue JSON 저장: ${issuesOutputPath}`);
-
-    // 백업 JSON 저장 - Rules (최종 결과)
-    const rulesOutputPath = path.join(
-      config.paths.output.rules,
-      `rules_from_issues_${Date.now()}.json`
-    );
-    await writeJsonFile(rulesOutputPath, {
-      extractedAt: new Date().toISOString(),
-      source: 'issues',
-      count: taggedRules.length,
+    // 고정 경로에 JSON 저장 (통일 스키마)
+    const outputPath = config.paths.output.issuesJson;
+    await writeJsonFile(outputPath, {
+      metadata: {
+        source: 'issue',
+        extractedAt: new Date().toISOString(),
+        version: '4.2',
+        count: taggedRules.length
+      },
       rules: taggedRules
     });
-    logger.info(`📄 Rule JSON 저장: ${rulesOutputPath}`);
+
+    logger.info(`✅ ${taggedRules.length}개 룰 저장 완료: ${outputPath}`);
 
     return {
       issues: allIssues,
       rules: taggedRules,
       files: files.length,
-      outputPath: rulesOutputPath
+      outputPath
     };
   }
 

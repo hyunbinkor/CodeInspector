@@ -18,7 +18,6 @@ import path from 'path';
 import JSZip from 'jszip';
 import { parseStringPromise } from 'xml2js';
 import { getLLMClient } from '../clients/llmClient.js';
-import { getQdrantClient } from '../clients/qdrantClient.js';
 import { getRuleTagger } from '../tagger/ruleTagger.js';
 import { writeJsonFile, listFiles } from '../utils/fileUtils.js';
 import { config } from '../config/config.js';
@@ -27,7 +26,6 @@ import logger from '../utils/loggerUtils.js';
 export class GuidelineExtractor {
   constructor() {
     this.llmClient = null;
-    this.qdrantClient = null;
     this.ruleTagger = null;
     this.initialized = false;
 
@@ -49,9 +47,6 @@ export class GuidelineExtractor {
 
     this.llmClient = getLLMClient();
     await this.llmClient.initialize();
-
-    this.qdrantClient = getQdrantClient();
-    await this.qdrantClient.initialize();
 
     this.ruleTagger = getRuleTagger();
     await this.ruleTagger.initialize();
@@ -87,21 +82,19 @@ export class GuidelineExtractor {
     logger.info('룰 태깅 시작...');
     const taggedRules = await this.ruleTagger.tagRules(allRules);
 
-    // Qdrant 저장
-    logger.info('Qdrant 저장 시작...');
-    await this.qdrantClient.storeRules(taggedRules);
-
-    // 백업 JSON 저장
-    const outputPath = path.join(
-      config.paths.output.rules,
-      `guidelines_${Date.now()}.json`
-    );
+    // 고정 경로에 JSON 저장 (통일 스키마)
+    const outputPath = config.paths.output.guidelinesJson;
     await writeJsonFile(outputPath, {
-      extractedAt: new Date().toISOString(),
-      source: 'guidelines',
-      count: taggedRules.length,
+      metadata: {
+        source: 'guideline',
+        extractedAt: new Date().toISOString(),
+        version: '4.2',
+        count: taggedRules.length
+      },
       rules: taggedRules
     });
+
+    logger.info(`✅ ${taggedRules.length}개 룰 저장 완료: ${outputPath}`);
 
     return {
       rules: taggedRules,
