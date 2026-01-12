@@ -213,8 +213,9 @@ export class CodeChecker {
 
     // Step 6: LLM 검증 (후보가 있을 때만)
     if (filterResult.llmCandidates.total > 0) {
+      // llmCalls는 verifyWithLLM 내부에서 개별 호출마다 증가
       const llmViolations = await this.verifyWithLLM(
-        code, astAnalysis, filterResult.llmCandidates, fileName
+        code, astAnalysis, filterResult.llmCandidates, fileName, tags
       );
       issues.push(...llmViolations);
     }
@@ -562,7 +563,7 @@ export class CodeChecker {
   /**
    * LLM 통합 검증
    */
-  async verifyWithLLM(sourceCode, astAnalysis, llmCandidates, fileName) {
+  async verifyWithLLM(sourceCode, astAnalysis, llmCandidates, fileName, tags) {
     const violations = [];
 
     // 모든 후보를 하나의 배열로 통합
@@ -585,7 +586,8 @@ export class CodeChecker {
       const ruleNum = i + 1;
 
       try {
-        const prompt = this.buildSingleRulePrompt(truncatedCode, item);
+        // 개선된 프롬프트: AST 정보 + 태그 + 예시 포함
+        const prompt = this.buildSingleRulePrompt(truncatedCode, item, astAnalysis, tags);
         
         const startTime = Date.now();
         const response = await this.llmClient.generateCompletion(prompt, {
@@ -640,40 +642,32 @@ export class CodeChecker {
   }
 
   /**
-   * 단일 규칙 검증용 프롬프트 생성
+   * 단일 규칙 검증용 프롬프트 생성 (개선 버전)
+   * 
+   * 포함 정보:
+   * - AST 구조 정보 (클래스, 메서드, 어노테이션, 복잡도)
+   * - AST 자동 탐지 이슈 (카테고리 관련)
+   * - 코드 프로파일 (태그)
+   * - 코드 예시 (problematicCode, fixedCode)
+   * - checkType별 컨텍스트 (패턴, 체크포인트, 키워드)
+   * - 거짓 양성 필터링 가이드
    */
-  buildSingleRulePrompt(sourceCode, item) {
+  buildSingleRulePrompt(sourceCode, item, astAnalysis, tags) {
     const rule = item.rule;
     const type = item.type;
 
-    let ruleContext = '';
+    // 각 섹션 생성
+    const astSection = this._buildAstSection(astAnalysis);
+    const detectedIssuesSection = this._buildDetectedIssuesSection(astAnalysis, rule);
+    const profileSection = this._buildProfileSection(tags);
+    const examplesSection = this._buildExamplesSection(rule);
+    const contextSection = this._buildContextSection(item, type);
+    const falsePositiveGuide = this._buildFalsePositiveGuide();
 
-    if (type === 'llm_with_regex' && item.candidates?.length > 0) {
-      const candidateLines = item.candidates
-        .map(c => `- 라인 ${c.line}: ${c.content}`)
-        .join('\n');
-      ruleContext = `
-**의심되는 위치 (정규식 매칭):**
-${candidateLines}
-
-위 위치들이 실제로 규칙을 위반하는지 검증하세요.`;
-    } else if (type === 'llm_with_ast') {
-      const checkPoints = (rule.checkPoints || []).map(cp => `- ${cp}`).join('\n');
-      ruleContext = `
-**AST 체크포인트:**
-${checkPoints || '- 규칙 준수 여부 확인'}
-
-위 체크포인트를 기준으로 검증하세요.`;
-    } else {
-      // llm_contextual
-      const keywords = (rule.keywords || []).join(', ');
-      ruleContext = `
-**관련 키워드:** ${keywords || '없음'}
-
-코드 전체를 분석하여 이 규칙의 위반 여부를 판단하세요.`;
-    }
-
-    return `다음 Java 코드가 주어진 규칙을 위반하는지 검사하세요.
+    return `다음 Java 코드가 주어진 규칙을 위반하는지 검사하고 한글로 응답하세요.
+${astSection}
+${detectedIssuesSection}
+${profileSection}
 
 ## 검사 대상 코드
 \`\`\`java
@@ -686,26 +680,283 @@ ${sourceCode}
 - **설명:** ${rule.description || '없음'}
 - **카테고리:** ${rule.category || 'general'}
 - **심각도:** ${rule.severity || 'MEDIUM'}
-${ruleContext}
+${examplesSection}
+${contextSection}
+${falsePositiveGuide}
 
 ## 출력 형식 (JSON)
 \`\`\`json
 {
   "violation": true 또는 false,
   "line": 위반 라인 번호 (위반인 경우),
-  "title": "위반 제목",
   "description": "구체적인 위반 내용",
   "suggestion": "수정 제안",
   "confidence": 0.0~1.0
 }
 \`\`\`
 
-## 판단 기준
-1. **확실한 위반만** true로 반환
-2. 애매하거나 불확실하면 false
-3. 위반이 아니면 간단히 {"violation": false} 반환
+## 최종 판단 기준
+1. **확실한 위반만** violation: true 반환 (confidence 0.8 이상)
+2. 애매하거나 불확실하면 violation: false
+3. goodPatterns에 매칭되면 violation: false
+4. 거짓 양성 조건에 해당하면 violation: false
+5. 위반이 아니면 간단히 {"violation": false} 반환
 
 JSON만 출력하세요.`;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // 프롬프트 헬퍼 메서드들
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /**
+   * AST 구조 정보 섹션 생성
+   */
+  _buildAstSection(astAnalysis) {
+    if (!astAnalysis) return '';
+    
+    // 클래스 정보
+    const classes = astAnalysis.classDeclarations?.map(c => {
+      let info = c.name;
+      if (c.extends) info += ` extends ${c.extends}`;
+      if (c.implements?.length) info += ` implements ${c.implements.join(', ')}`;
+      return info;
+    }).join(', ') || 'N/A';
+    
+    // 메서드 정보 (최대 8개)
+    const methods = astAnalysis.methodDeclarations?.slice(0, 8).map(m => 
+      `${m.returnType} ${m.name}(${m.parameters || ''})`
+    ) || [];
+    const methodList = methods.length > 0 
+      ? methods.map(m => `  - ${m}`).join('\n')
+      : '  - N/A';
+    const methodExtra = (astAnalysis.methodDeclarations?.length || 0) > 8 
+      ? `\n  - ... 외 ${astAnalysis.methodDeclarations.length - 8}개` 
+      : '';
+    
+    // 어노테이션 (최대 10개)
+    const annotations = astAnalysis.annotations?.slice(0, 10).join(', ') || 'N/A';
+    const annotationExtra = (astAnalysis.annotations?.length || 0) > 10 
+      ? `, ... 외 ${astAnalysis.annotations.length - 10}개` 
+      : '';
+    
+    // 복잡도
+    const depth = astAnalysis.maxDepth || 0;
+    const complexity = astAnalysis.cyclomaticComplexity || 1;
+    
+    return `
+## 코드 구조 정보 (AST 분석)
+- **클래스:** ${classes}
+- **메서드:**
+${methodList}${methodExtra}
+- **어노테이션:** ${annotations}${annotationExtra}
+- **복잡도:** 중첩 깊이 ${depth}, 순환 복잡도 ${complexity}`;
+  }
+
+  /**
+   * AST 자동 탐지 이슈 섹션 생성 (카테고리 관련만)
+   */
+  _buildDetectedIssuesSection(astAnalysis, rule) {
+    if (!astAnalysis) return '';
+    
+    const relevantIssues = [];
+    const category = (rule.category || '').toLowerCase();
+    const title = (rule.title || '').toLowerCase();
+    const description = (rule.description || '').toLowerCase();
+    const combinedText = `${category} ${title} ${description}`;
+    
+    // 예외 처리 관련
+    if (combinedText.includes('exception') || combinedText.includes('error') || 
+        combinedText.includes('예외') || combinedText.includes('catch')) {
+      if (astAnalysis.exceptionHandling?.length > 0) {
+        relevantIssues.push(...astAnalysis.exceptionHandling.map(e => ({
+          type: e.type,
+          description: e.description,
+          severity: e.severity || 'MEDIUM'
+        })));
+      }
+    }
+    
+    // 리소스 관리 관련
+    if (combinedText.includes('resource') || combinedText.includes('memory') ||
+        combinedText.includes('리소스') || combinedText.includes('close') ||
+        combinedText.includes('connection') || combinedText.includes('stream')) {
+      const leaks = (astAnalysis.resourceLifecycles || [])
+        .filter(r => !r.hasCloseCall && !r.inTryWithResources);
+      if (leaks.length > 0) {
+        relevantIssues.push(...leaks.map(r => ({
+          type: 'RESOURCE_LEAK_RISK',
+          description: `${r.type} 리소스 해제 누락 가능성`,
+          severity: 'HIGH'
+        })));
+      }
+    }
+    
+    // 보안 관련
+    if (combinedText.includes('security') || combinedText.includes('보안') ||
+        combinedText.includes('sql') || combinedText.includes('injection')) {
+      if (astAnalysis.securityPatterns?.length > 0) {
+        relevantIssues.push(...astAnalysis.securityPatterns);
+      }
+    }
+    
+    // 성능 관련
+    if (combinedText.includes('performance') || combinedText.includes('성능') ||
+        combinedText.includes('loop') || combinedText.includes('반복')) {
+      if (astAnalysis.performanceIssues?.length > 0) {
+        relevantIssues.push(...astAnalysis.performanceIssues);
+      }
+      if (astAnalysis.loopAnalysis?.hasDbCallInLoop) {
+        relevantIssues.push({
+          type: 'DB_CALL_IN_LOOP',
+          description: '루프 내 DB 호출 감지 (N+1 쿼리 위험)',
+          severity: 'HIGH'
+        });
+      }
+      if (astAnalysis.loopAnalysis?.hasNestedLoop) {
+        relevantIssues.push({
+          type: 'NESTED_LOOP',
+          description: '중첩 루프 감지 (성능 저하 가능)',
+          severity: 'MEDIUM'
+        });
+      }
+    }
+    
+    if (relevantIssues.length === 0) return '';
+    
+    const issueList = relevantIssues.slice(0, 5).map(i => 
+      `- **${i.type}**: ${i.description} (${i.severity})`
+    ).join('\n');
+    
+    return `
+## AST 자동 탐지 이슈 (참고)
+${issueList}
+
+위 이슈는 AST 분석으로 자동 탐지되었습니다. 규칙 위반 판단 시 참고하세요.`;
+  }
+
+  /**
+   * 코드 프로파일 섹션 생성
+   */
+  _buildProfileSection(tags) {
+    if (!tags || tags.length === 0) return '';
+    
+    const displayTags = tags.slice(0, 15).join(', ');
+    const extra = tags.length > 15 ? `, ... 외 ${tags.length - 15}개` : '';
+    
+    return `
+## 코드 프로파일
+- **태그:** ${displayTags}${extra}`;
+  }
+
+  /**
+   * 코드 예시 섹션 생성 (problematicCode, fixedCode 활용)
+   */
+  _buildExamplesSection(rule) {
+    const parts = [];
+    
+    // 잘못된 예 (problematicCode 또는 badExample)
+    const badCode = rule.problematicCode || rule.badExample;
+    if (badCode) {
+      parts.push(`
+**잘못된 예 (피해야 할 코드):**
+\`\`\`java
+${this._truncateText(badCode, 500)}
+\`\`\``);
+    }
+    
+    // 올바른 예 (fixedCode 또는 goodExample)
+    const goodCode = rule.fixedCode || rule.goodExample;
+    if (goodCode) {
+      parts.push(`
+**올바른 예 (권장하는 코드):**
+\`\`\`java
+${this._truncateText(goodCode, 500)}
+\`\`\``);
+    }
+    
+    if (parts.length === 0) return '';
+    
+    return `
+## 코드 예시
+${parts.join('\n')}`;
+  }
+
+  /**
+   * checkType별 컨텍스트 섹션 생성
+   */
+  _buildContextSection(item, type) {
+    const rule = item.rule;
+    
+    if (type === 'llm_with_regex') {
+      // 정규식 매칭 결과 + 패턴 정보
+      const candidateLines = item.candidates?.slice(0, 10).map(c => 
+        `- 라인 ${c.line}: \`${this._truncateText(c.content, 80)}\``
+      ).join('\n') || '- 없음';
+      
+      const antiPatterns = rule.antiPatterns?.slice(0, 5).map(p => 
+        `- \`${p.pattern}\`${p.description ? ` - ${p.description}` : ''}`
+      ).join('\n') || '- 없음';
+      
+      const goodPatterns = rule.goodPatterns?.slice(0, 5).map(p => 
+        `- \`${p.pattern}\`${p.description ? ` - ${p.description}` : ''}`
+      ).join('\n') || '- 없음';
+      
+      return `
+## 패턴 매칭 정보
+**의심되는 위치 (정규식 탐지):**
+${candidateLines}
+
+**위반 패턴 (antiPatterns):**
+${antiPatterns}
+
+**예외 패턴 (goodPatterns) - 매칭 시 위반 아님:**
+${goodPatterns}`;
+    }
+    
+    if (type === 'llm_with_ast') {
+      const checkPoints = rule.checkPoints?.map(cp => `- ${cp}`).join('\n') 
+        || '- 규칙 준수 여부 확인';
+      
+      return `
+## AST 분석 체크포인트
+${checkPoints}
+
+위 체크포인트와 코드 구조 정보를 기반으로 검증하세요.`;
+    }
+    
+    // llm_contextual
+    const keywords = rule.keywords?.slice(0, 15).join(', ') || '없음';
+    
+    return `
+## 컨텍스트 분석
+- **관련 키워드:** ${keywords}
+
+코드 전체의 의미와 맥락을 분석하여 위반 여부를 판단하세요.`;
+  }
+
+  /**
+   * 거짓 양성 필터링 가이드
+   */
+  _buildFalsePositiveGuide() {
+    return `
+## 거짓 양성 필터링
+다음 경우는 위반이 **아닙니다**:
+1. 주석 내 코드 (\`//\` 또는 \`/* */\` 내부)
+2. 문자열 리터럴 내 패턴 (\`"..."\` 내부)
+3. 테스트 코드 (\`@Test\`, \`*Test.java\`, \`*Spec.java\`)
+4. 의도적 예외 처리 (\`@SuppressWarnings\`, \`// NOSONAR\`, \`// NOPMD\`)
+5. goodPatterns에 매칭되는 코드
+6. import 문, package 선언문`;
+  }
+
+  /**
+   * 텍스트 자르기 유틸리티
+   */
+  _truncateText(text, maxLen) {
+    if (!text) return '';
+    if (text.length <= maxLen) return text;
+    return text.substring(0, maxLen) + '...';
   }
 
   /**
