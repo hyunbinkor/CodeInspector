@@ -7,6 +7,7 @@
  * - llm_with_regex: 정규식 후보 → LLM 검증
  * - llm_contextual: 태그/키워드 필터 → LLM 분석
  * - llm_with_ast: AST 정보 + LLM 검증
+ * - 3000줄 이상 자동 청킹 지원
  * 
  * @module checker/codeChecker
  */
@@ -17,6 +18,8 @@ import { getQdrantClient } from '../clients/qdrantClient.js';
 import { getLLMClient } from '../clients/llmClient.js';
 import { getJavaAstParser } from '../ast/javaAstParser.js';
 import { getResultBuilder } from './resultBuilder.js';
+import { MethodChunker } from '../chunker/methodChunker.js';
+import { ChunkResultMerger } from '../chunker/chunkResultMerger.js';
 import { listFiles, readTextFile, writeJsonFile } from '../utils/fileUtils.js';
 import { config } from '../config/config.js';
 import logger from '../utils/loggerUtils.js';
@@ -38,7 +41,16 @@ export class CodeChecker {
     this.llmClient = null;
     this.astParser = null;
     this.resultBuilder = null;
+    this.methodChunker = null;
+    this.chunkResultMerger = null;
     this.initialized = false;
+
+    // 청킹 설정
+    this.chunkingConfig = {
+      autoChunkThreshold: 3000,  // 3000줄 이상이면 자동 청킹
+      warnThreshold: 2000,
+      hardLimit: 5000
+    };
 
     // 유효한 checkType (v4.0)
     this.validCheckTypes = ['pure_regex', 'llm_with_regex', 'llm_contextual', 'llm_with_ast'];
@@ -72,6 +84,10 @@ export class CodeChecker {
 
     this.astParser = getJavaAstParser();
     this.resultBuilder = getResultBuilder();
+
+    // 청킹 모듈 초기화
+    this.methodChunker = new MethodChunker(this.chunkingConfig);
+    this.chunkResultMerger = new ChunkResultMerger();
 
     this.initialized = true;
     logger.info('✅ CodeChecker 초기화 완료');
@@ -162,15 +178,33 @@ export class CodeChecker {
    * 코드 점검 (메인 로직 - v4.0)
    * 
    * 처리 흐름 (기존 guidelineChecker.js checkRules):
-   * 1. 코드 태깅 (프로파일 생성)
-   * 2. 태그 기반 룰 조회
-   * 3. preFilterRules()로 checkType별 사전 필터링
-   * 4. pure_regex 즉시 판정
-   * 5. LLM 후보 통합 검증
-   * 6. 중복 제거 및 결과 정리
+   * 1. 3000줄 이상 → 자동 청킹 모드
+   * 2. 코드 태깅 (프로파일 생성)
+   * 3. 태그 기반 룰 조회
+   * 4. preFilterRules()로 checkType별 사전 필터링
+   * 5. pure_regex 즉시 판정
+   * 6. LLM 후보 통합 검증
+   * 7. 중복 제거 및 결과 정리
+   * 
+   * @param {string} code - Java 소스 코드
+   * @param {string} fileName - 파일명
+   * @param {Object} options - 옵션 (forceChunk, outputFormat 등)
+   * @returns {Object} 검사 결과
    */
-  async checkCode(code, fileName = 'unknown') {
+  async checkCode(code, fileName = 'unknown', options = {}) {
     const startTime = Date.now();
+    const lineCount = code.split('\n').length;
+
+    // 청킹 필요 여부 판단
+    const needsChunking = options.forceChunk || 
+                          this.methodChunker.needsChunking(code);
+
+    if (needsChunking) {
+      logger.info(`[${fileName}] 대용량 파일 (${lineCount}줄) - 청킹 모드 활성화`);
+      return this.checkCodeChunked(code, fileName, options);
+    }
+
+    // 일반 모드
     this.filteringStats.totalChecks++;
 
     // Step 1: 코드 태깅
@@ -592,7 +626,7 @@ export class CodeChecker {
         const startTime = Date.now();
         const response = await this.llmClient.generateCompletion(prompt, {
           temperature: 0.1,
-          max_tokens: 3000
+          max_tokens: 1000
         });
         const elapsed = Date.now() - startTime;
 
@@ -664,7 +698,7 @@ export class CodeChecker {
     const contextSection = this._buildContextSection(item, type);
     const falsePositiveGuide = this._buildFalsePositiveGuide();
 
-    return `다음 Java 코드가 주어진 규칙을 위반하는지 검사하고 한글로 응답하세요.
+    return `다음 Java 코드가 주어진 규칙을 위반하는지 검사하세요.
 ${astSection}
 ${detectedIssuesSection}
 ${profileSection}
@@ -1222,6 +1256,205 @@ ${rulesDescription}
    */
   _sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // 청킹 모드 검사
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /**
+   * 청킹 모드 코드 점검
+   * 
+   * 대용량 파일(3000줄+)을 메서드 단위로 분할하여 개별 검사 후 통합
+   * 
+   * @param {string} code - Java 소스 코드
+   * @param {string} fileName - 파일명
+   * @param {Object} options - 옵션
+   * @returns {Object} 통합된 검사 결과
+   */
+  async checkCodeChunked(code, fileName, options = {}) {
+    const startTime = Date.now();
+    const outputFormat = options.outputFormat || 'sarif';
+
+    logger.info(`[${fileName}] 🔪 청킹 시작...`);
+
+    // 1. 코드 청킹
+    const chunkingResult = this.methodChunker.chunk(code, { fileName });
+    const { chunks, metadata: chunkMeta } = chunkingResult;
+
+    logger.info(`[${fileName}] ${chunkMeta.totalChunks}개 청크 생성 (${chunkMeta.totalMethods}개 메서드)`);
+
+    // 2. 청크별 검사 (순차 처리 - LLM 부하 방지)
+    const chunkResults = [];
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+
+      // 헤더/푸터 청크는 검사 스킵 (메서드가 아님)
+      if (chunk.type === 'header' || chunk.type === 'footer') {
+        logger.debug(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.type}] 스킵`);
+        chunkResults.push({
+          chunkIndex: chunk.index,
+          issues: [],
+          processingTime: 0,
+          llmCalls: 0
+        });
+        continue;
+      }
+
+      logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName}] 검사 중...`);
+
+      try {
+        // 청크 코드 (헤더 포함 버전 또는 원본)
+        const chunkCode = chunk.codeWithHeader || chunk.code;
+
+        // 개별 청크 검사 (청킹 없이)
+        const chunkStartTime = Date.now();
+        const result = await this.checkCodeDirect(chunkCode, `${fileName}:${chunk.methodName}`);
+        const chunkElapsed = Date.now() - chunkStartTime;
+
+        chunkResults.push({
+          chunkIndex: chunk.index,
+          issues: result.issues || [],
+          processingTime: chunkElapsed,
+          llmCalls: result.stats?.llmCalls || 0
+        });
+
+        logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName}] 완료: ${result.issues?.length || 0}개 이슈 (${chunkElapsed}ms)`);
+
+        // API 부하 방지 딜레이
+        if (i < chunks.length - 1) {
+          await this._sleep(200);
+        }
+
+      } catch (error) {
+        logger.error(`[${fileName}] 청크 ${i + 1} 검사 실패: ${error.message}`);
+        chunkResults.push({
+          chunkIndex: chunk.index,
+          issues: [],
+          processingTime: 0,
+          llmCalls: 0,
+          error: error.message
+        });
+      }
+    }
+
+    // 3. 결과 통합
+    const mergedResult = this.chunkResultMerger.merge(chunkResults, chunkingResult, options);
+    mergedResult.processing.startTime = new Date(startTime).toISOString();
+
+    const totalElapsed = Date.now() - startTime;
+    logger.info(`[${fileName}] 🎯 청킹 검사 완료: ${mergedResult.summary.totalIssues}개 이슈 (${totalElapsed}ms)`);
+
+    // 4. 출력 형식 변환
+    if (outputFormat === 'sarif') {
+      const sarif = this.chunkResultMerger.toSARIF(mergedResult, options);
+      return {
+        success: true,
+        chunked: true,
+        format: 'sarif',
+        sarif,
+        // 기존 호환용
+        issues: mergedResult.issues,
+        summary: mergedResult.summary,
+        stats: {
+          ...this.filteringStats,
+          processingTime: totalElapsed,
+          chunksProcessed: mergedResult.processing.processedChunks,
+          totalChunks: mergedResult.processing.totalChunks
+        }
+      };
+    } else if (outputFormat === 'github') {
+      const annotations = this.chunkResultMerger.toGitHubAnnotations(mergedResult);
+      return {
+        success: true,
+        chunked: true,
+        format: 'github',
+        annotations,
+        issues: mergedResult.issues,
+        summary: mergedResult.summary,
+        stats: {
+          ...this.filteringStats,
+          processingTime: totalElapsed
+        }
+      };
+    } else {
+      // 기본: JSON
+      const simple = this.chunkResultMerger.toSimpleJSON(mergedResult);
+      return {
+        success: true,
+        chunked: true,
+        format: 'json',
+        ...simple,
+        stats: {
+          ...this.filteringStats,
+          processingTime: totalElapsed
+        }
+      };
+    }
+  }
+
+  /**
+   * 직접 코드 검사 (청킹 없이)
+   * 
+   * checkCode()에서 청킹 판단 없이 직접 검사 수행
+   * 청킹 모드에서 개별 청크 검사 시 사용
+   * 
+   * @param {string} code - 코드
+   * @param {string} fileName - 파일명
+   * @returns {Object} 검사 결과
+   */
+  async checkCodeDirect(code, fileName) {
+    const startTime = Date.now();
+    this.filteringStats.totalChecks++;
+
+    // Step 1: 코드 태깅
+    const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
+    const tags = taggingResult.tags;
+
+    // Step 2: AST 분석
+    const astResult = this.astParser.parseJavaCode(code);
+    const astAnalysis = astResult.analysis;
+
+    // Step 3: 태그 기반 룰 조회
+    const matchedRules = await this.qdrantClient.findRulesByTags(tags, {
+      limit: 50,
+      scoreThreshold: 0.3
+    });
+
+    if (matchedRules.length === 0) {
+      return {
+        success: true,
+        issues: [],
+        stats: { llmCalls: 0 }
+      };
+    }
+
+    // Step 4: 사전 필터링
+    const filterResult = this.preFilterRules(code, astAnalysis, matchedRules);
+
+    // Step 5: pure_regex 위반 수집
+    const issues = [...filterResult.pureRegexViolations];
+
+    // Step 6: LLM 검증
+    if (filterResult.llmCandidates.total > 0) {
+      const llmViolations = await this.verifyWithLLM(
+        code, astAnalysis, filterResult.llmCandidates, fileName, tags
+      );
+      issues.push(...llmViolations);
+    }
+
+    // Step 7: 중복 제거
+    const uniqueIssues = this.deduplicateViolations(issues);
+
+    return {
+      success: true,
+      issues: uniqueIssues,
+      stats: {
+        llmCalls: this.filteringStats.llmCalls,
+        llmCandidates: filterResult.llmCandidates.total
+      }
+    };
   }
 }
 

@@ -18,6 +18,7 @@ import { syncQdrant } from './sync/qdrantSync.js';
 import { checkCode } from './checker/codeChecker.js';
 import { getResultBuilder } from './checker/resultBuilder.js';
 import { getQdrantClient } from './clients/qdrantClient.js';
+import { writeJsonFile } from './utils/fileUtils.js';
 import logger from './utils/loggerUtils.js';
 
 /**
@@ -134,12 +135,74 @@ async function runCheck() {
   console.log('\n🔍 코드 점검');
   console.log('-'.repeat(50));
 
+  // CLI 옵션 파싱
+  const args = process.argv.slice(3);
+  let outputFormat = 'json';  // 기본값
+  let outputFile = null;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--format' && args[i + 1]) {
+      outputFormat = args[i + 1].toLowerCase();
+      i++;
+    } else if (args[i] === '-o' && args[i + 1]) {
+      outputFile = args[i + 1];
+      i++;
+    } else if (args[i].startsWith('--format=')) {
+      outputFormat = args[i].split('=')[1].toLowerCase();
+    } else if (args[i].startsWith('-o=')) {
+      outputFile = args[i].split('=')[1];
+    }
+  }
+
+  // 출력 형식 검증
+  const validFormats = ['json', 'sarif', 'github'];
+  if (!validFormats.includes(outputFormat)) {
+    console.log(`\n⚠️ 지원하지 않는 형식: ${outputFormat}`);
+    console.log(`   지원 형식: ${validFormats.join(', ')}`);
+    outputFormat = 'json';
+  }
+
+  console.log(`   출력 형식: ${outputFormat.toUpperCase()}`);
+
   const result = await checkCode();
   const resultBuilder = getResultBuilder();
 
-  // 개별 파일 결과 출력
-  for (const report of result.reports || []) {
-    console.log(resultBuilder.formatForConsole(report));
+  // 청킹된 경우 별도 처리
+  if (result.reports?.some(r => r.chunked)) {
+    console.log('\n📦 청킹 모드로 검사됨');
+    
+    for (const report of result.reports) {
+      if (report.chunked) {
+        console.log(`\n📄 ${report.file || 'unknown'}`);
+        console.log(`   - 총 청크: ${report.stats?.totalChunks || 0}개`);
+        console.log(`   - 발견 이슈: ${report.summary?.totalIssues || 0}개`);
+        console.log(`   - 처리 시간: ${report.stats?.processingTime || 0}ms`);
+
+        // SARIF 형식 저장
+        if (outputFormat === 'sarif' && report.sarif) {
+          const sarifPath = outputFile || result.outputPath?.replace('.json', '.sarif.json');
+          if (sarifPath) {
+            await writeJsonFile(sarifPath, report.sarif);
+            console.log(`   - SARIF 저장: ${sarifPath}`);
+          }
+        }
+
+        // GitHub 어노테이션 출력
+        if (outputFormat === 'github' && report.annotations) {
+          console.log('\n--- GitHub Actions Annotations ---');
+          console.log(report.annotations);
+          console.log('--- End ---');
+        }
+      } else {
+        // 일반 리포트 출력
+        console.log(resultBuilder.formatForConsole(report));
+      }
+    }
+  } else {
+    // 일반 모드 출력
+    for (const report of result.reports || []) {
+      console.log(resultBuilder.formatForConsole(report));
+    }
   }
 
   // 요약 출력
@@ -183,7 +246,7 @@ async function runClearRules() {
  */
 function printHelp() {
   console.log(`
-사용법: node src/main.js <command>
+사용법: node src/main.js <command> [options]
 
 명령어:
   extract-guidelines    개발 가이드(docx)에서 룰 추출 → JSON 저장
@@ -199,9 +262,15 @@ function printHelp() {
                               output/rules/issues.json
                         동작: Qdrant 초기화 후 저장
 
-  check                 코드 점검 실행
+  check [options]       코드 점검 실행
                         입력: input/code/*.java
                         출력: output/reports/*.json
+                        
+                        옵션:
+                          --format <type>   출력 형식 (json|sarif|github)
+                          -o <file>         출력 파일 경로
+                        
+                        ※ 3000줄 이상 파일은 자동 청킹
 
   clear-rules           Qdrant의 모든 룰 삭제 (주의!)
 
@@ -218,6 +287,14 @@ function printHelp() {
   node src/main.js extract-issues
   node src/main.js sync-qdrant
   node src/main.js check
+  node src/main.js check --format sarif
+  node src/main.js check --format github
+  node src/main.js check --format sarif -o result.sarif.json
+
+출력 형식:
+  json      기본 JSON 형식
+  sarif     SARIF 2.1.0 (IDE/CI 통합용)
+  github    GitHub Actions 어노테이션
 
 디렉토리 구조:
   input/
