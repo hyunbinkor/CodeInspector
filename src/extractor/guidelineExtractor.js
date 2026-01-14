@@ -1,7 +1,10 @@
 /**
- * 가이드라인 추출기 V4.2 (기존 docx 파싱 로직 100% 복원)
+ * 가이드라인 추출기 V4.3 (다중 파일 지원)
  * 
  * 핵심 기능:
+ * - 다중 DOCX 파일 → 단일 JSON (ruleId 충돌 방지)
+ * - 파일별 고유 prefix 자동 생성
+ * - 출처 추적 (sourceFile, sourcePrefix)
  * - DOCX 순서 보장 파싱 (preserveChildrenOrder + explicitChildren)
  * - 목차 기반 섹션 분리 (_Toc anchor)
  * - Bookmark 기반 정확한 섹션 추출
@@ -10,7 +13,7 @@
  * - Context vs Guideline 분류
  * 
  * @module extractor/guidelineExtractor
- * @version 4.2
+ * @version 4.3
  */
 
 import fs from 'fs/promises';
@@ -35,6 +38,12 @@ export class GuidelineExtractor {
     this.imageRelations = new Map();
     this.guidelines = [];
     this.contextRules = [];
+
+    // 현재 처리 중인 파일 정보 (V4.3)
+    this.currentFileInfo = {
+      filename: null,
+      prefix: 'GEN'
+    };
   }
 
   /**
@@ -43,7 +52,7 @@ export class GuidelineExtractor {
   async initialize() {
     if (this.initialized) return;
 
-    logger.info('🚀 가이드라인 추출기 V4.2 초기화 중...');
+    logger.info('🚀 가이드라인 추출기 V4.3 초기화 중...');
 
     this.llmClient = getLLMClient();
     await this.llmClient.initialize();
@@ -56,7 +65,12 @@ export class GuidelineExtractor {
   }
 
   /**
-   * 입력 디렉토리의 모든 docx 파일에서 룰 추출
+   * 입력 디렉토리의 모든 docx 파일에서 룰 추출 (V4.3 - 다중 파일 지원)
+   * 
+   * 개선사항:
+   * - 파일별 고유 prefix 생성 (ruleId 충돌 방지)
+   * - sources 메타데이터로 출처 추적
+   * - 파일별 통계 수집
    */
   async extractAll() {
     const inputDir = config.paths.input.guidelines;
@@ -69,11 +83,33 @@ export class GuidelineExtractor {
 
     logger.info(`${files.length}개 docx 파일 발견`);
 
+    // 파일별 prefix 생성 (중복 방지)
+    const prefixMap = this.generatePrefixMap(files);
+    logger.info('📌 파일별 Prefix 할당:');
+    for (const [filePath, prefix] of prefixMap.entries()) {
+      logger.info(`   - ${path.basename(filePath)} → ${prefix}`);
+    }
+
     const allRules = [];
+    const sources = [];
 
     for (const filePath of files) {
-      const result = await this.extractFromFile(filePath);
+      const filename = path.basename(filePath);
+      const prefix = prefixMap.get(filePath);
+      const fileStartTime = new Date();
+
+      const result = await this.extractFromFile(filePath, { prefix, filename });
+      
       allRules.push(...result.guidelines);
+
+      // 파일별 통계 수집
+      sources.push({
+        filename,
+        prefix,
+        rulesCount: result.guidelines.length,
+        contextRulesCount: result.contextRules?.length || 0,
+        extractedAt: fileStartTime.toISOString()
+      });
     }
 
     logger.info(`총 ${allRules.length}개 룰 추출 완료`);
@@ -82,14 +118,16 @@ export class GuidelineExtractor {
     logger.info('룰 태깅 시작...');
     const taggedRules = await this.ruleTagger.tagRules(allRules);
 
-    // 고정 경로에 JSON 저장 (통일 스키마)
+    // 고정 경로에 JSON 저장 (V4.3 스키마)
     const outputPath = config.paths.output.guidelinesJson;
     await writeJsonFile(outputPath, {
       metadata: {
         source: 'guideline',
         extractedAt: new Date().toISOString(),
-        version: '4.2',
-        count: taggedRules.length
+        version: '4.3',
+        totalCount: taggedRules.length,
+        filesProcessed: files.length,
+        sources
       },
       rules: taggedRules
     });
@@ -99,15 +137,132 @@ export class GuidelineExtractor {
     return {
       rules: taggedRules,
       files: files.length,
+      sources,
       outputPath
     };
   }
 
   /**
-   * 단일 docx 파일에서 룰 추출 (V4.2 - 순서 보장)
+   * 파일 목록에서 고유 prefix 맵 생성
+   * 
+   * @param {string[]} files - 파일 경로 배열
+   * @returns {Map<string, string>} 파일경로 → prefix 맵
    */
-  async extractFromFile(filePath) {
-    logger.info(`📄 파일 처리: ${path.basename(filePath)}`);
+  generatePrefixMap(files) {
+    const prefixMap = new Map();
+    const usedPrefixes = new Set();
+
+    for (const filePath of files) {
+      const filename = path.basename(filePath);
+      let prefix = this.generatePrefix(filename);
+      
+      // 중복 시 숫자 추가
+      prefix = this.ensureUniquePrefix(prefix, usedPrefixes);
+      
+      prefixMap.set(filePath, prefix);
+      usedPrefixes.add(prefix);
+    }
+
+    return prefixMap;
+  }
+
+  /**
+   * 파일명에서 prefix 생성
+   * 
+   * @param {string} filename - 파일명
+   * @returns {string} prefix (대문자)
+   */
+  generatePrefix(filename) {
+    const name = filename.toLowerCase().replace(/\.docx$/i, '');
+
+    // 키워드 → prefix 매핑
+    const mappings = [
+      { keywords: ['개발표준', '개발_표준', 'dev_standard', 'development'], prefix: 'DEV' },
+      { keywords: ['보안', 'security', 'sec_guide'], prefix: 'SEC' },
+      { keywords: ['성능', 'performance', 'perf'], prefix: 'PERF' },
+      { keywords: ['아키텍처', 'architecture', 'arch'], prefix: 'ARCH' },
+      { keywords: ['코딩', 'coding', 'style', '스타일'], prefix: 'STY' },
+      { keywords: ['에러', 'error', 'exception', '예외'], prefix: 'ERR' },
+      { keywords: ['리소스', 'resource', '자원'], prefix: 'RES' },
+      { keywords: ['네이밍', 'naming', '명명'], prefix: 'NAM' },
+      { keywords: ['문서', 'document', 'doc'], prefix: 'DOC' },
+      { keywords: ['테스트', 'test', 'testing'], prefix: 'TST' },
+      { keywords: ['데이터', 'data', 'db', 'database'], prefix: 'DAT' },
+      { keywords: ['api', 'rest', 'endpoint'], prefix: 'API' },
+    ];
+
+    for (const { keywords, prefix } of mappings) {
+      if (keywords.some(kw => name.includes(kw))) {
+        return prefix;
+      }
+    }
+
+    // 매핑 실패 시: 파일명에서 추출
+    // 한글 → 영문 앞글자, 영문 → 대문자 변환
+    const extracted = this.extractPrefixFromName(name);
+    return extracted || 'GEN';
+  }
+
+  /**
+   * 파일명에서 prefix 추출 (키워드 매핑 실패 시)
+   */
+  extractPrefixFromName(name) {
+    // 언더스코어/하이픈으로 분리된 단어의 첫 글자
+    const parts = name.split(/[_\-\s]+/);
+    
+    if (parts.length >= 2) {
+      // 각 파트의 첫 글자 조합 (최대 4자)
+      const prefix = parts
+        .slice(0, 4)
+        .map(p => p.charAt(0).toUpperCase())
+        .join('');
+      
+      if (prefix.length >= 2) {
+        return prefix;
+      }
+    }
+
+    // 단일 단어: 앞 3글자
+    const cleaned = name.replace(/[^a-zA-Z0-9가-힣]/g, '');
+    if (cleaned.length >= 3) {
+      return cleaned.substring(0, 3).toUpperCase();
+    }
+
+    return null;
+  }
+
+  /**
+   * prefix 중복 방지
+   * 
+   * @param {string} prefix - 원본 prefix
+   * @param {Set<string>} usedPrefixes - 이미 사용된 prefix 집합
+   * @returns {string} 고유한 prefix
+   */
+  ensureUniquePrefix(prefix, usedPrefixes) {
+    if (!usedPrefixes.has(prefix)) {
+      return prefix;
+    }
+
+    // 숫자 추가하여 고유화
+    let counter = 2;
+    while (usedPrefixes.has(`${prefix}${counter}`)) {
+      counter++;
+    }
+
+    return `${prefix}${counter}`;
+  }
+
+  /**
+   * 단일 docx 파일에서 룰 추출 (V4.3 - prefix 지원)
+   * 
+   * @param {string} filePath - 파일 경로
+   * @param {Object} options - 옵션 { prefix, filename }
+   */
+  async extractFromFile(filePath, options = {}) {
+    const filename = options.filename || path.basename(filePath);
+    const prefix = options.prefix || 'GEN';
+
+    logger.info(`📄 파일 처리: ${filename} [${prefix}]`);
 
     try {
       // 상태 초기화
@@ -115,6 +270,9 @@ export class GuidelineExtractor {
       this.imageRelations = new Map();
       this.guidelines = [];
       this.contextRules = [];
+
+      // 현재 파일 정보 저장 (하위 메서드에서 사용)
+      this.currentFileInfo = { filename, prefix };
 
       return await this.extractFromDOCX(filePath);
 
@@ -125,11 +283,11 @@ export class GuidelineExtractor {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // DOCX 파싱 (V4.2 - 순서 보장)
+  // DOCX 파싱 (V4.3 - 다중 파일 지원)
   // ═══════════════════════════════════════════════════════════════════════════
 
   async extractFromDOCX(docxPath) {
-    logger.info('📘 DOCX 파싱 시작 (V4.2 - 순서 보장)...');
+    logger.info('📘 DOCX 파싱 시작 (V4.3)...');
 
     try {
       // Step 1: ZIP 로드
@@ -784,8 +942,13 @@ JSON만 출력하세요.`;
       'general': 'GEN'
     };
 
-    const prefix = categoryPrefix[category] || 'GEN';
-    const ruleId = `${prefix}.${section.sectionNumber.replace(/\./g, '_')}`;
+    const catPrefix = categoryPrefix[category] || 'GEN';
+    const docPrefix = this.currentFileInfo.prefix;
+    
+    // V4.3: ruleId에 문서 prefix 추가
+    // 형식: {docPrefix}.{categoryPrefix}.{sectionNumber}
+    // 예: DEV.ERR.3_2, SEC.RES.4_1
+    const ruleId = `${docPrefix}.${catPrefix}.${section.sectionNumber.replace(/\./g, '_')}`;
 
     return {
       ruleId,
@@ -798,6 +961,9 @@ JSON만 출력하세요.`;
       message: result.message || result.title || section.title,
       suggestion: result.suggestion || '',
       source: `guideline:${section.sectionNumber}`,
+      // V4.3: 출처 추적 필드
+      sourceFile: this.currentFileInfo.filename,
+      sourcePrefix: docPrefix,
       isActive: true,
       // 코드 예시 (RuleTagger에서 활용)
       problematicCode: result.badExample || null,
@@ -810,7 +976,8 @@ JSON만 출력하세요.`;
       metadata: {
         createdAt: new Date().toISOString(),
         source: `${section.sectionNumber} ${section.title}`,
-        version: '4.2'
+        sourceFile: this.currentFileInfo.filename,
+        version: '4.3'
       }
     };
   }
@@ -830,8 +997,11 @@ JSON만 출력하세요.`;
       'general': 'GEN'
     };
 
-    const prefix = categoryPrefix[category] || 'GEN';
-    const ruleId = `${prefix}.${section.sectionNumber.replace(/\./g, '_')}`;
+    const catPrefix = categoryPrefix[category] || 'GEN';
+    const docPrefix = this.currentFileInfo.prefix;
+    
+    // V4.3: ruleId에 문서 prefix 추가
+    const ruleId = `${docPrefix}.${catPrefix}.${section.sectionNumber.replace(/\./g, '_')}`;
 
     return {
       ruleId,
@@ -843,12 +1013,16 @@ JSON만 출력하세요.`;
       description: ruleText?.substring(0, 500) || section.title,
       message: `${section.title} 규칙을 위반했습니다`,
       source: `guideline:${section.sectionNumber}`,
+      // V4.3: 출처 추적 필드
+      sourceFile: this.currentFileInfo.filename,
+      sourcePrefix: docPrefix,
       isActive: true,
       keywords: this.extractKeywordsFromText(section.title, ruleText || ''),
       metadata: {
         createdAt: new Date().toISOString(),
         source: `${section.sectionNumber} ${section.title}`,
-        version: '4.2',
+        sourceFile: this.currentFileInfo.filename,
+        version: '4.3',
         isFallback: true
       },
       hasTables: content.tables?.length > 0,

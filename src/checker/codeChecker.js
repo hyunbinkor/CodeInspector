@@ -48,8 +48,8 @@ export class CodeChecker {
     // 청킹 설정
     this.chunkingConfig = {
       autoChunkThreshold: 3000,  // 3000줄 이상이면 자동 청킹
-      warnThreshold: 2000,
-      hardLimit: 5000
+      warnThreshold: 3000,
+      hardLimit: 15000
     };
 
     // 유효한 checkType (v4.0)

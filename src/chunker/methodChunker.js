@@ -24,9 +24,9 @@ export class MethodChunker {
       preserveImports: options.preserveImports !== false,
       verbose: options.verbose || false,
       // 경고 임계값 - 이 값을 넘으면 경고하지만 메서드 완성까지 대기
-      warnThreshold: options.warnThreshold || 2000,
+      warnThreshold: options.warnThreshold || 3000,
       // 강제 중단 임계값 - 정말 비정상적인 경우에만
-      hardLimit: options.hardLimit || 5000,
+      hardLimit: options.hardLimit || 15000,
       // 자동 청킹 기준 라인 수
       autoChunkThreshold: options.autoChunkThreshold || 3000
     };
@@ -336,6 +336,7 @@ export class MethodChunker {
     let foundMethodSignature = false;
     let currentIndex = startIndex;
     let warned = false;
+    let inBlockComment = false;  // 블록 주석 상태 추적
 
     // 1. 어노테이션과 JavaDoc 수집
     while (currentIndex < lines.length) {
@@ -405,15 +406,14 @@ export class MethodChunker {
         }
       }
 
-      // 중괄호 카운팅
-      for (const char of line) {
-        if (char === '{') {
-          braceDepth++;
-          signatureComplete = true;
-        } else if (char === '}') {
-          braceDepth--;
-        }
+      // 중괄호 카운팅 (문자열/주석 내 중괄호 무시)
+      const braceResult = this.countBraces(line, inBlockComment);
+      inBlockComment = braceResult.inBlockComment;  // 블록 주석 상태 업데이트
+      
+      if (braceResult.open > 0) {
+        signatureComplete = true;
       }
+      braceDepth += braceResult.open - braceResult.close;
 
       currentIndex++;
 
@@ -461,6 +461,102 @@ export class MethodChunker {
       endLine: currentIndex - 1,
       lineCount: methodLines.length
     };
+  }
+
+  /**
+   * 중괄호 카운팅 (문자열/주석 내 중괄호 무시)
+   * 
+   * @param {string} line - 코드 라인
+   * @param {boolean} inBlockComment - 블록 주석 내부 여부
+   * @returns {Object} { open, close, inBlockComment }
+   */
+  countBraces(line, inBlockComment = false) {
+    let open = 0;
+    let close = 0;
+    let inString = false;
+    let inChar = false;
+    let stringChar = '';
+    let i = 0;
+
+    while (i < line.length) {
+      const char = line[i];
+      const nextChar = i < line.length - 1 ? line[i + 1] : '';
+
+      // 블록 주석 끝 감지
+      if (inBlockComment) {
+        if (char === '*' && nextChar === '/') {
+          inBlockComment = false;
+          i += 2;
+          continue;
+        }
+        i++;
+        continue;
+      }
+
+      // 블록 주석 시작 감지
+      if (!inString && !inChar && char === '/' && nextChar === '*') {
+        inBlockComment = true;
+        i += 2;
+        continue;
+      }
+
+      // 라인 주석 시작 → 나머지 무시
+      if (!inString && !inChar && char === '/' && nextChar === '/') {
+        break;
+      }
+
+      // 이스케이프 문자 처리
+      if (i > 0 && line[i - 1] === '\\' && !this.isEscapedBackslash(line, i - 1)) {
+        i++;
+        continue;
+      }
+
+      // 문자열 시작/끝 (")
+      if (char === '"' && !inChar) {
+        if (!inString) {
+          inString = true;
+          stringChar = '"';
+        } else if (stringChar === '"') {
+          inString = false;
+        }
+        i++;
+        continue;
+      }
+
+      // 문자 리터럴 시작/끝 (')
+      if (char === "'" && !inString) {
+        if (!inChar) {
+          inChar = true;
+        } else {
+          inChar = false;
+        }
+        i++;
+        continue;
+      }
+
+      // 문자열/문자 리터럴/주석 밖에서만 중괄호 카운트
+      if (!inString && !inChar) {
+        if (char === '{') open++;
+        else if (char === '}') close++;
+      }
+
+      i++;
+    }
+
+    return { open, close, inBlockComment };
+  }
+
+  /**
+   * 백슬래시가 이스케이프된 백슬래시인지 확인
+   * (\\인 경우 true)
+   */
+  isEscapedBackslash(line, index) {
+    let count = 0;
+    for (let i = index; i >= 0 && line[i] === '\\'; i--) {
+      count++;
+    }
+    // 백슬래시가 짝수 개면 이스케이프된 것
+    return count % 2 === 0;
   }
 }
 
