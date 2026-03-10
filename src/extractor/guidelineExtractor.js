@@ -1,19 +1,17 @@
 /**
- * 가이드라인 추출기 V4.3 (다중 파일 지원)
- * 
- * 핵심 기능:
- * - 다중 DOCX 파일 → 단일 JSON (ruleId 충돌 방지)
- * - 파일별 고유 prefix 자동 생성
- * - 출처 추적 (sourceFile, sourcePrefix)
- * - DOCX 순서 보장 파싱 (preserveChildrenOrder + explicitChildren)
- * - 목차 기반 섹션 분리 (_Toc anchor)
- * - Bookmark 기반 정확한 섹션 추출
- * - 테이블 → Markdown 변환
- * - 이미지 관계 로드
- * - Context vs Guideline 분류
- * 
+ * 가이드라인 추출기 V4.4 (버그 수정)
+ *
+ * 변경사항 (v4.3 → v4.4):
+ * 1. [Fix] extractSectionsByBookmarks: 단락당 중복 북마크로 인한 ruleId 중복 생성 버그 수정
+ *    - 동일 단락에 _Toc 북마크가 여러 개 있어도 섹션을 한 번만 생성 (sectionCreated 플래그)
+ *    - bookmarkStarts.length === 0 조건을 !sectionCreated 로 변경
+ *      → TOC 미매칭 북마크가 있는 단락의 내용 누락 버그도 동시 수정
+ * 2. [Fix] createFallbackGuideline: 내용 없는 섹션에서 빈 껍데기 규칙 생성 방지
+ *    - effectiveText 길이 30자 미만이면 null 반환
+ *    - convertToGuideline 호출부에서 null 체크 후 조건부 push
+ *
  * @module extractor/guidelineExtractor
- * @version 4.3
+ * @version 4.4
  */
 
 import fs from 'fs/promises';
@@ -46,13 +44,10 @@ export class GuidelineExtractor {
     };
   }
 
-  /**
-   * 초기화
-   */
   async initialize() {
     if (this.initialized) return;
 
-    logger.info('🚀 가이드라인 추출기 V4.3 초기화 중...');
+    logger.info('🚀 가이드라인 추출기 V4.4 초기화 중...');
 
     this.llmClient = getLLMClient();
     await this.llmClient.initialize();
@@ -64,14 +59,6 @@ export class GuidelineExtractor {
     logger.info('✅ GuidelineExtractor 초기화 완료');
   }
 
-  /**
-   * 입력 디렉토리의 모든 docx 파일에서 룰 추출 (V4.3 - 다중 파일 지원)
-   * 
-   * 개선사항:
-   * - 파일별 고유 prefix 생성 (ruleId 충돌 방지)
-   * - sources 메타데이터로 출처 추적
-   * - 파일별 통계 수집
-   */
   async extractAll() {
     const inputDir = config.paths.input.guidelines;
     const files = await listFiles(inputDir, '.docx');
@@ -83,7 +70,6 @@ export class GuidelineExtractor {
 
     logger.info(`${files.length}개 docx 파일 발견`);
 
-    // 파일별 prefix 생성 (중복 방지)
     const prefixMap = this.generatePrefixMap(files);
     logger.info('📌 파일별 Prefix 할당:');
     for (const [filePath, prefix] of prefixMap.entries()) {
@@ -99,10 +85,9 @@ export class GuidelineExtractor {
       const fileStartTime = new Date();
 
       const result = await this.extractFromFile(filePath, { prefix, filename });
-      
+
       allRules.push(...result.guidelines);
 
-      // 파일별 통계 수집
       sources.push({
         filename,
         prefix,
@@ -114,17 +99,15 @@ export class GuidelineExtractor {
 
     logger.info(`총 ${allRules.length}개 룰 추출 완료`);
 
-    // 태깅
     logger.info('룰 태깅 시작...');
     const taggedRules = await this.ruleTagger.tagRules(allRules);
 
-    // 고정 경로에 JSON 저장 (V4.3 스키마)
     const outputPath = config.paths.output.guidelinesJson;
     await writeJsonFile(outputPath, {
       metadata: {
         source: 'guideline',
         extractedAt: new Date().toISOString(),
-        version: '4.3',
+        version: '4.4',
         totalCount: taggedRules.length,
         filesProcessed: files.length,
         sources
@@ -142,12 +125,6 @@ export class GuidelineExtractor {
     };
   }
 
-  /**
-   * 파일 목록에서 고유 prefix 맵 생성
-   * 
-   * @param {string[]} files - 파일 경로 배열
-   * @returns {Map<string, string>} 파일경로 → prefix 맵
-   */
   generatePrefixMap(files) {
     const prefixMap = new Map();
     const usedPrefixes = new Set();
@@ -155,10 +132,9 @@ export class GuidelineExtractor {
     for (const filePath of files) {
       const filename = path.basename(filePath);
       let prefix = this.generatePrefix(filename);
-      
-      // 중복 시 숫자 추가
+
       prefix = this.ensureUniquePrefix(prefix, usedPrefixes);
-      
+
       prefixMap.set(filePath, prefix);
       usedPrefixes.add(prefix);
     }
@@ -166,16 +142,9 @@ export class GuidelineExtractor {
     return prefixMap;
   }
 
-  /**
-   * 파일명에서 prefix 생성
-   * 
-   * @param {string} filename - 파일명
-   * @returns {string} prefix (대문자)
-   */
   generatePrefix(filename) {
     const name = filename.toLowerCase().replace(/\.docx$/i, '');
 
-    // 키워드 → prefix 매핑
     const mappings = [
       { keywords: ['개발표준', '개발_표준', 'dev_standard', 'development'], prefix: 'DEV' },
       { keywords: ['보안', 'security', 'sec_guide'], prefix: 'SEC' },
@@ -197,32 +166,24 @@ export class GuidelineExtractor {
       }
     }
 
-    // 매핑 실패 시: 파일명에서 추출
-    // 한글 → 영문 앞글자, 영문 → 대문자 변환
     const extracted = this.extractPrefixFromName(name);
     return extracted || 'GEN';
   }
 
-  /**
-   * 파일명에서 prefix 추출 (키워드 매핑 실패 시)
-   */
   extractPrefixFromName(name) {
-    // 언더스코어/하이픈으로 분리된 단어의 첫 글자
     const parts = name.split(/[_\-\s]+/);
-    
+
     if (parts.length >= 2) {
-      // 각 파트의 첫 글자 조합 (최대 4자)
       const prefix = parts
         .slice(0, 4)
         .map(p => p.charAt(0).toUpperCase())
         .join('');
-      
+
       if (prefix.length >= 2) {
         return prefix;
       }
     }
 
-    // 단일 단어: 앞 3글자
     const cleaned = name.replace(/[^a-zA-Z0-9가-힣]/g, '');
     if (cleaned.length >= 3) {
       return cleaned.substring(0, 3).toUpperCase();
@@ -231,19 +192,11 @@ export class GuidelineExtractor {
     return null;
   }
 
-  /**
-   * prefix 중복 방지
-   * 
-   * @param {string} prefix - 원본 prefix
-   * @param {Set<string>} usedPrefixes - 이미 사용된 prefix 집합
-   * @returns {string} 고유한 prefix
-   */
   ensureUniquePrefix(prefix, usedPrefixes) {
     if (!usedPrefixes.has(prefix)) {
       return prefix;
     }
 
-    // 숫자 추가하여 고유화
     let counter = 2;
     while (usedPrefixes.has(`${prefix}${counter}`)) {
       counter++;
@@ -252,12 +205,6 @@ export class GuidelineExtractor {
     return `${prefix}${counter}`;
   }
 
-  /**
-   * 단일 docx 파일에서 룰 추출 (V4.3 - prefix 지원)
-   * 
-   * @param {string} filePath - 파일 경로
-   * @param {Object} options - 옵션 { prefix, filename }
-   */
   async extractFromFile(filePath, options = {}) {
     const filename = options.filename || path.basename(filePath);
     const prefix = options.prefix || 'GEN';
@@ -265,13 +212,11 @@ export class GuidelineExtractor {
     logger.info(`📄 파일 처리: ${filename} [${prefix}]`);
 
     try {
-      // 상태 초기화
       this.tableOfContents = new Map();
       this.imageRelations = new Map();
       this.guidelines = [];
       this.contextRules = [];
 
-      // 현재 파일 정보 저장 (하위 메서드에서 사용)
       this.currentFileInfo = { filename, prefix };
 
       return await this.extractFromDOCX(filePath);
@@ -283,20 +228,18 @@ export class GuidelineExtractor {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // DOCX 파싱 (V4.3 - 다중 파일 지원)
+  // DOCX 파싱
   // ═══════════════════════════════════════════════════════════════════════════
 
   async extractFromDOCX(docxPath) {
-    logger.info('📘 DOCX 파싱 시작 (V4.3)...');
+    logger.info('📘 DOCX 파싱 시작 (V4.4)...');
 
     try {
-      // Step 1: ZIP 로드
       const buffer = await fs.readFile(docxPath);
       this.docxZip = await JSZip.loadAsync(buffer);
 
       const documentXml = await this.docxZip.file('word/document.xml').async('string');
 
-      // 🔑 순서 보장 옵션 (기존 로직 100% 유지)
       const doc = await parseStringPromise(documentXml, {
         preserveChildrenOrder: true,
         explicitChildren: true,
@@ -305,20 +248,16 @@ export class GuidelineExtractor {
 
       const body = doc['w:document']['w:body'][0];
 
-      // Step 2: 이미지 관계 로드
       await this.loadImageRelations();
 
-      // Step 3: 목차 파싱
       logger.info('\n📋 Step 1/3: 목차 파싱 중...');
       this.parseTableOfContents(body);
       logger.info(`✅ 목차 ${this.tableOfContents.size}개 항목 파싱 완료`);
 
-      // Step 4: Bookmark 기반 섹션 추출 (순서 보장)
       logger.info('\n📑 Step 2/3: Bookmark 기반 섹션 추출 중...');
       const sections = await this.extractSectionsByBookmarks(body);
       logger.info(`✅ 총 ${sections.length}개 섹션 추출 완료`);
 
-      // 테이블 통계
       const sectionsWithTables = sections.filter(s =>
         s.contentElements.some(e => e.type === 'table')
       );
@@ -327,14 +266,19 @@ export class GuidelineExtractor {
       );
       logger.info(`📊 테이블이 있는 섹션: ${sectionsWithTables.length}개, 총 테이블: ${totalTables}개`);
 
-      // Step 5: Context vs Guidelines 분류
       const contextSections = sections.filter(s => s.isContext);
       const guidelineSections = sections.filter(s => !s.isContext);
 
       logger.info(`  📋 Context Rules: ${contextSections.length}개`);
       logger.info(`  📜 Guidelines: ${guidelineSections.length}개`);
 
-      // Step 6: Context Rules 처리
+      // 중복 섹션 번호 사전 감지 (디버그용)
+      const sectionNumbers = guidelineSections.map(s => s.sectionNumber);
+      const dupes = sectionNumbers.filter((id, i) => sectionNumbers.indexOf(id) !== i);
+      if (dupes.length > 0) {
+        logger.warn(`⚠️ 중복 섹션 번호 감지: ${[...new Set(dupes)].join(', ')}`);
+      }
+
       this.contextRules = contextSections.map(ctx => ({
         ruleId: `ctx.${ctx.contextType}`,
         title: ctx.title,
@@ -345,7 +289,6 @@ export class GuidelineExtractor {
         contextType: ctx.contextType
       }));
 
-      // Step 7: Guideline 처리 (LLM 배치)
       logger.info('\n📦 Step 3/3: Guideline 구조화 중...');
       this.guidelines = [];
       const batchSize = 5;
@@ -359,7 +302,6 @@ export class GuidelineExtractor {
 
         await Promise.all(batch.map(section => this.convertToGuideline(section)));
 
-        // API 부하 방지
         await this._sleep(200);
       }
 
@@ -378,9 +320,6 @@ export class GuidelineExtractor {
     }
   }
 
-  /**
-   * 이미지 관계 로드
-   */
   async loadImageRelations() {
     try {
       const relsXml = await this.docxZip.file('word/_rels/document.xml.rels').async('string');
@@ -404,7 +343,7 @@ export class GuidelineExtractor {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 목차 파싱 ($$ 구조 대응)
+  // 목차 파싱
   // ═══════════════════════════════════════════════════════════════════════════
 
   parseTableOfContents(body) {
@@ -466,7 +405,7 @@ export class GuidelineExtractor {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Bookmark 기반 섹션 추출 (순서 보장)
+  // Bookmark 기반 섹션 추출 (V4.4 - 중복 북마크 버그 수정)
   // ═══════════════════════════════════════════════════════════════════════════
 
   async extractSectionsByBookmarks(body) {
@@ -482,7 +421,15 @@ export class GuidelineExtractor {
       if (type === 'w:p') {
         const bookmarkStarts = this.findBookmarkStarts(element);
 
+        // ✅ [Fix v4.4] 단락당 첫 번째 TOC 매칭 북마크만 처리
+        // 동일 단락에 _Toc 북마크가 여러 개 있을 때 (Word 자동생성 중복, 교차참조 북마크 등)
+        // 기존: 루프가 여러 번 돌아 동일 sectionNumber 섹션이 sections[]에 중복 push됨
+        // 수정: sectionCreated 플래그로 단락당 섹션 생성을 1회로 제한
+        let sectionCreated = false;
+
         for (const bookmark of bookmarkStarts) {
+          if (sectionCreated) break; // 이미 이 단락에서 섹션 생성 완료 → 나머지 북마크 무시
+
           const bookmarkName = bookmark.$?.['w:name'];
           if (!bookmarkName) continue;
 
@@ -511,12 +458,18 @@ export class GuidelineExtractor {
               currentSection.contextType = contextInfo.contextType;
               currentSection.appliesTo = contextInfo.appliesTo;
             }
+
+            sectionCreated = true; // 섹션 생성 완료 표시
           }
         }
 
         if (skipUntilTocEnd) continue;
 
-        if (currentSection && bookmarkStarts.length === 0) {
+        // ✅ [Fix v4.4] bookmarkStarts.length === 0 → !sectionCreated 로 변경
+        // 기존: 북마크가 있는 단락(TOC 미매칭 포함)은 내용 추가가 통째로 누락됨
+        // 수정: 이번 단락에서 새 섹션이 생기지 않은 경우만 내용으로 추가
+        //       (TOC 미매칭 북마크가 있는 본문 단락의 내용도 정상 수집)
+        if (currentSection && !sectionCreated) {
           currentSection.contentElements.push({ type: 'paragraph', element });
         }
       }
@@ -540,13 +493,9 @@ export class GuidelineExtractor {
     return sections;
   }
 
-  /**
-   * 순서 보장된 body 요소 추출
-   */
   getOrderedBodyElements(body) {
     const elements = [];
 
-    // $$ 구조 우선 사용 (순서 보장)
     if (body.$$) {
       for (const child of body.$$) {
         const tagName = child['#name'];
@@ -558,7 +507,6 @@ export class GuidelineExtractor {
       return elements;
     }
 
-    // 폴백: 키 기반 추출 (순서 보장 불가)
     logger.warn('⚠️ body.$$ 없음 - 순서 보장 불가!');
 
     for (const [key, value] of Object.entries(body)) {
@@ -632,9 +580,6 @@ export class GuidelineExtractor {
     return null;
   }
 
-  /**
-   * 재귀적 텍스트 추출 (기존 로직 100%)
-   */
   extractTextFromElement(element) {
     const texts = [];
 
@@ -654,7 +599,6 @@ export class GuidelineExtractor {
 
     extractRecursive(element);
 
-    // 폴백: $$ 없는 경우
     if (texts.length === 0) {
       const runs = element['w:r'] || [];
       for (const run of runs) {
@@ -761,7 +705,6 @@ export class GuidelineExtractor {
       tableData.push(rowData);
     }
 
-    // 단일 셀 → 텍스트박스로 처리
     if (tableData.length === 1 && tableData[0].length === 1) {
       return {
         type: 'textbox',
@@ -856,8 +799,9 @@ export class GuidelineExtractor {
       const result = this.llmClient.cleanAndExtractJSON(response);
 
       if (!result) {
+        // ✅ [Fix v4.4] null 체크 후 조건부 push
         const guideline = this.createFallbackGuideline(section, content, ruleText);
-        this.guidelines.push(guideline);
+        if (guideline) this.guidelines.push(guideline);
         return;
       }
 
@@ -868,8 +812,9 @@ export class GuidelineExtractor {
 
     } catch (error) {
       logger.error(`  ❌ 변환 실패: ${section.sectionNumber} - ${error.message}`);
+      // ✅ [Fix v4.4] null 체크 후 조건부 push
       const guideline = this.createFallbackGuideline(section, { text: '', tables: [], images: [] }, '');
-      this.guidelines.push(guideline);
+      if (guideline) this.guidelines.push(guideline);
     }
   }
 
@@ -913,7 +858,6 @@ JSON만 출력하세요.`;
   }
 
   normalizeGuideline(result, section, content, ruleText) {
-    // 카테고리 정규화
     const validCategories = [
       'resource_management', 'security', 'exception_handling',
       'performance', 'architecture', 'code_style', 'naming_convention',
@@ -923,13 +867,11 @@ JSON만 출력하세요.`;
       ? result.category.toLowerCase()
       : this.inferCategory(section.title, ruleText);
 
-    // 심각도 정규화
     const validSeverities = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
     const severity = validSeverities.includes(result.severity?.toUpperCase())
       ? result.severity.toUpperCase()
       : this.inferSeverity(section.title, ruleText);
 
-    // 카테고리 접두사
     const categoryPrefix = {
       'resource_management': 'RES',
       'security': 'SEC',
@@ -944,10 +886,7 @@ JSON만 출력하세요.`;
 
     const catPrefix = categoryPrefix[category] || 'GEN';
     const docPrefix = this.currentFileInfo.prefix;
-    
-    // V4.3: ruleId에 문서 prefix 추가
-    // 형식: {docPrefix}.{categoryPrefix}.{sectionNumber}
-    // 예: DEV.ERR.3_2, SEC.RES.4_1
+
     const ruleId = `${docPrefix}.${catPrefix}.${section.sectionNumber.replace(/\./g, '_')}`;
 
     return {
@@ -961,15 +900,12 @@ JSON만 출력하세요.`;
       message: result.message || result.title || section.title,
       suggestion: result.suggestion || '',
       source: `guideline:${section.sectionNumber}`,
-      // V4.3: 출처 추적 필드
       sourceFile: this.currentFileInfo.filename,
       sourcePrefix: docPrefix,
       isActive: true,
-      // 코드 예시 (RuleTagger에서 활용)
       problematicCode: result.badExample || null,
       fixedCode: result.goodExample || null,
       keywords: result.keywords || this.extractKeywordsFromText(section.title, ruleText),
-      // 문서 컨텍스트
       hasTables: content.tables.length > 0,
       hasImages: content.images?.length > 0,
       tables: content.tables,
@@ -977,12 +913,20 @@ JSON만 출력하세요.`;
         createdAt: new Date().toISOString(),
         source: `${section.sectionNumber} ${section.title}`,
         sourceFile: this.currentFileInfo.filename,
-        version: '4.3'
+        version: '4.4'
       }
     };
   }
 
+  // ✅ [Fix v4.4] 내용이 없는 섹션은 null 반환 → 빈 껍데기 규칙 생성 방지
   createFallbackGuideline(section, content, ruleText) {
+    // 유효 텍스트 확인: ruleText + content.text 합산
+    const effectiveText = (ruleText?.trim() || '') + (content?.text?.trim() || '');
+    if (effectiveText.length < 30) {
+      logger.warn(`⚠️ 빈 fallback 건너뜀: [${section.sectionNumber}] ${section.title} (텍스트 ${effectiveText.length}자)`);
+      return null; // 호출부에서 null 체크 후 push 건너뜀
+    }
+
     const category = this.inferCategory(section.title, ruleText || '');
 
     const categoryPrefix = {
@@ -999,8 +943,7 @@ JSON만 출력하세요.`;
 
     const catPrefix = categoryPrefix[category] || 'GEN';
     const docPrefix = this.currentFileInfo.prefix;
-    
-    // V4.3: ruleId에 문서 prefix 추가
+
     const ruleId = `${docPrefix}.${catPrefix}.${section.sectionNumber.replace(/\./g, '_')}`;
 
     return {
@@ -1013,7 +956,6 @@ JSON만 출력하세요.`;
       description: ruleText?.substring(0, 500) || section.title,
       message: `${section.title} 규칙을 위반했습니다`,
       source: `guideline:${section.sectionNumber}`,
-      // V4.3: 출처 추적 필드
       sourceFile: this.currentFileInfo.filename,
       sourcePrefix: docPrefix,
       isActive: true,
@@ -1022,7 +964,7 @@ JSON만 출력하세요.`;
         createdAt: new Date().toISOString(),
         source: `${section.sectionNumber} ${section.title}`,
         sourceFile: this.currentFileInfo.filename,
-        version: '4.3',
+        version: '4.4',
         isFallback: true
       },
       hasTables: content.tables?.length > 0,
@@ -1064,7 +1006,6 @@ JSON만 출력하세요.`;
     const keywords = [];
     const text = `${title} ${content}`.toLowerCase();
 
-    // Java 관련 키워드
     const javaKeywords = [
       'exception', 'try', 'catch', 'finally', 'throw',
       'connection', 'stream', 'resource', 'close',
@@ -1103,9 +1044,10 @@ JSON만 출력하세요.`;
   }
 }
 
-/**
- * 싱글톤 인스턴스
- */
+// ═══════════════════════════════════════════════════════════════════════════
+// Singleton
+// ═══════════════════════════════════════════════════════════════════════════
+
 let instance = null;
 
 export function getGuidelineExtractor() {
@@ -1115,9 +1057,6 @@ export function getGuidelineExtractor() {
   return instance;
 }
 
-/**
- * CLI용 래퍼 함수
- */
 export async function extractGuidelines() {
   const extractor = getGuidelineExtractor();
   await extractor.initialize();
