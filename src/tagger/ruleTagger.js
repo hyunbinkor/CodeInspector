@@ -1,17 +1,22 @@
 /**
  * 룰 태거 (LLM 기반)
- * 
+ *
  * 추출된 룰에 태그를 부여하여 코드와 매칭 가능하게 함
- * 
+ *
  * ═══════════════════════════════════════════════════════════════════
  * 금융권 원칙: "탐지는 넓게, 검증은 LLM"
  * ═══════════════════════════════════════════════════════════════════
- * 
+ *
  * - 문제를 놓치지 않는 것이 최우선 과제
  * - 패턴은 넓게 잡아서 후보를 많이 탐지
  * - LLM이 실제 문제인지 최종 검증
  * - pure_regex는 극히 제한적으로만 사용
- * 
+ *
+ * 변경사항 (v4.4):
+ * - [Fix] tagRule: tagCondition 검증 실패 시 LLM 재호출 (최대 2회)
+ * - [Fix] validateTagCondition: 대문자 태그명+논리연산자만 허용, 소문자/코드 차단
+ * - [Fix] buildTaggingPrompt: tagCondition 작성 규칙 명시, isRetry 강조 경고 추가
+ *
  * @module tagger/ruleTagger
  */
 
@@ -24,7 +29,7 @@ export class RuleTagger {
     this.llmClient = null;
     this.tagLoader = null;
     this.initialized = false;
-    
+
     // pure_regex 허용 목록 (100% 확실한 경우만)
     this.pureRegexAllowList = [
       'System.out.print',
@@ -53,57 +58,126 @@ export class RuleTagger {
     logger.info('✅ RuleTagger 초기화 완료');
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 룰 태깅 (tagCondition 검증 실패 시 재시도)
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
    * 룰에 태그 부여
-   * 
+   *
+   * tagCondition 검증 실패 시 최대 2회까지 LLM 재호출.
+   * 2회 모두 실패하면 tagCondition=null로 나머지 필드는 살려서 반환.
+   * JSON 파싱 자체가 실패하면 applyFallbackTags() 적용.
+   *
    * @param {Object} rule - 룰 객체
    * @returns {Promise<Object>} 태그가 부여된 룰
    */
   async tagRule(rule) {
-    try {
-      const prompt = this.buildTaggingPrompt(rule);
-      
-      const response = await this.llmClient.generateCompletion(prompt, {
-        temperature: 0.1,
-        max_tokens: 1500,
-        system_prompt: 'You are an expert at categorizing Java code quality rules for financial systems. Respond only in valid JSON format.'
-      });
+    const MAX_RETRIES = 2;
 
-      const tagResult = this.llmClient.cleanAndExtractJSON(response);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const isRetry = attempt > 1;
+        const prompt = this.buildTaggingPrompt(rule, isRetry);
 
-      if (!tagResult) {
-        logger.warn(`룰 태깅 실패 (JSON 파싱): ${rule.ruleId}`);
-        return this.applyFallbackTags(rule);
+        const response = await this.llmClient.generateCompletion(prompt, {
+          temperature: isRetry ? 0.0 : 0.1,  // 재시도 시 더 결정론적으로
+          max_tokens: 1500,
+          system_prompt: 'You are an expert at categorizing Java code quality rules for financial systems. Respond only in valid JSON format.'
+        });
+
+        const tagResult = this.llmClient.cleanAndExtractJSON(response);
+
+        if (!tagResult) {
+          logger.warn(`[${rule.ruleId}] JSON 파싱 실패 (시도 ${attempt}/${MAX_RETRIES})`);
+          if (attempt === MAX_RETRIES) return this.applyFallbackTags(rule);
+          continue;
+        }
+
+        // ✅ [Fix v4.4] tagCondition 유효성 검증
+        const tagConditionError = this.validateTagCondition(tagResult.tagCondition);
+        if (tagConditionError) {
+          logger.warn(`[${rule.ruleId}] tagCondition 검증 실패 (시도 ${attempt}/${MAX_RETRIES}): ${tagConditionError}`);
+          logger.warn(`  → 잘못된 값: "${String(tagResult.tagCondition).substring(0, 80)}"`);
+
+          if (attempt < MAX_RETRIES) {
+            continue;  // 재시도
+          }
+
+          // 마지막 시도도 실패 → tagCondition만 null, 나머지는 살림
+          logger.warn(`[${rule.ruleId}] tagCondition 포기 → null 저장, 나머지 필드는 유지`);
+          tagResult.tagCondition = null;
+        }
+
+        // checkType 검증 및 조정 (금융권 원칙)
+        const checkType = this.validateAndAdjustCheckType(
+          tagResult.checkType || 'llm_contextual', rule, tagResult
+        );
+
+        return {
+          ...rule,
+          tagCondition: tagResult.tagCondition || null,
+          requiredTags: tagResult.requiredTags || [],
+          excludeTags: tagResult.excludeTags || [],
+          checkType,
+          checkTypeReason: tagResult.reasoning || '',
+          antiPatterns: this.normalizePatterns(tagResult.antiPatterns),
+          goodPatterns: this.normalizePatterns(tagResult.goodPatterns)
+        };
+
+      } catch (error) {
+        logger.error(`[${rule.ruleId}] 태깅 오류 (시도 ${attempt}/${MAX_RETRIES}):`, error.message);
+        if (attempt === MAX_RETRIES) return this.applyFallbackTags(rule);
       }
-
-      // checkType 검증 및 조정 (금융권 원칙)
-      let checkType = tagResult.checkType || 'llm_contextual';
-      let checkTypeReason = tagResult.reasoning || '';
-      
-      checkType = this.validateAndAdjustCheckType(checkType, rule, tagResult);
-
-      // 태그 결과 적용 (패턴 정보 포함)
-      return {
-        ...rule,
-        tagCondition: tagResult.tagCondition || null,
-        requiredTags: tagResult.requiredTags || [],
-        excludeTags: tagResult.excludeTags || [],
-        checkType,
-        checkTypeReason,
-        // 패턴 정보 (이슈에서 코드가 있는 경우 LLM이 추출)
-        antiPatterns: this.normalizePatterns(tagResult.antiPatterns),
-        goodPatterns: this.normalizePatterns(tagResult.goodPatterns)
-      };
-
-    } catch (error) {
-      logger.error(`룰 태깅 오류 (${rule.ruleId}):`, error.message);
-      return this.applyFallbackTags(rule);
     }
+
+    return this.applyFallbackTags(rule);
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // tagCondition 유효성 검증
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * tagCondition 유효성 검증
+   *
+   * 대문자 태그명([A-Z][A-Z0-9_]*)과 논리연산자(&&, ||, !, 괄호, 공백)만 허용.
+   * 소문자, 점(.), 메서드 호출 등 실제 Java 코드가 섞이면 오류 반환.
+   *
+   * @param {string|null} tagCondition
+   * @returns {string|null} 오류 메시지 (null이면 정상)
+   */
+  validateTagCondition(tagCondition) {
+    if (!tagCondition) return null;  // null/undefined는 허용 (선택 필드)
+    if (typeof tagCondition !== 'string') return 'tagCondition이 문자열이 아님';
+
+    const trimmed = tagCondition.trim();
+    if (trimmed === '') return null;  // 빈 문자열도 허용
+
+    // 대문자 태그명 + &&/||/! + () + 공백만 허용
+    // 소문자, 점(.), 따옴표, 숫자로 시작하는 토큰 등은 불허
+    if (!/^[A-Z0-9_&|!()\s]+$/.test(trimmed)) {
+      return `허용되지 않은 문자 포함 (소문자·점·메서드 호출 등 실제 코드 의심): "${trimmed.substring(0, 60)}"`;
+    }
+
+    // 실제로 평가 가능한지 테스트 (괄호 불균형 등 방지)
+    try {
+      const testExpr = trimmed.replace(/\b[A-Z][A-Z0-9_]*\b/g, 'false');
+      new Function(`return (${testExpr})`)();
+    } catch (e) {
+      return `표현식 평가 불가: ${e.message}`;
+    }
+
+    return null;  // 정상
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // checkType 검증 및 조정
+  // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * checkType 검증 및 조정 (금융권 원칙)
-   * 
+   *
    * pure_regex는 극히 제한적으로만 허용
    * 확실하지 않으면 llm_with_regex 또는 llm_contextual로 변경
    */
@@ -113,18 +187,17 @@ export class RuleTagger {
       const titleLower = rule.title?.toLowerCase() || '';
       const descLower = rule.description?.toLowerCase() || '';
       const combinedText = `${titleLower} ${descLower}`;
-      
-      const isPureRegexAllowed = this.pureRegexAllowList.some(keyword => 
+
+      const isPureRegexAllowed = this.pureRegexAllowList.some(keyword =>
         combinedText.includes(keyword.toLowerCase())
       );
-      
+
       if (!isPureRegexAllowed) {
-        // pure_regex가 적절하지 않음 → llm_with_regex로 변경
         logger.info(`  🔄 [${rule.ruleId}] pure_regex → llm_with_regex (금융권 원칙: 문맥 검증 필요)`);
         return 'llm_with_regex';
       }
     }
-    
+
     // llm_with_regex인데 antiPatterns이 없으면 llm_contextual로
     if (checkType === 'llm_with_regex') {
       const hasAntiPatterns = tagResult.antiPatterns && tagResult.antiPatterns.length > 0;
@@ -133,25 +206,29 @@ export class RuleTagger {
         return 'llm_contextual';
       }
     }
-    
+
     // llm_with_ast인데 AST 관련 키워드가 없으면 llm_contextual로
     if (checkType === 'llm_with_ast') {
       const astKeywords = ['복잡도', '길이', '깊이', '파라미터', 'complexity', 'length', 'depth', 'nesting'];
       const titleLower = rule.title?.toLowerCase() || '';
       const hasAstKeyword = astKeywords.some(kw => titleLower.includes(kw));
-      
+
       if (!hasAstKeyword) {
         logger.info(`  🔄 [${rule.ruleId}] llm_with_ast → llm_contextual (AST 분석 불필요)`);
         return 'llm_contextual';
       }
     }
-    
+
     return checkType;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 배치 태깅
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
    * 룰 배치 태깅
-   * 
+   *
    * @param {Object[]} rules - 룰 배열
    * @returns {Promise<Object[]>} 태그가 부여된 룰 배열
    */
@@ -161,7 +238,7 @@ export class RuleTagger {
     for (const rule of rules) {
       const tagged = await this.tagRule(rule);
       taggedRules.push(tagged);
-      
+
       // 간단한 딜레이 (API 부하 방지)
       await this._sleep(100);
     }
@@ -170,24 +247,30 @@ export class RuleTagger {
     return taggedRules;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 프롬프트 생성
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
    * 태깅 프롬프트 생성
-   * 
+   *
    * 금융권 원칙: "탐지는 넓게, 검증은 LLM"
-   * 
    * - 가이드라인: 텍스트 기반 (코드 없음)
    * - 이슈: 코드 예시 포함 (problematicCode, fixedCode)
+   *
+   * @param {Object} rule - 룰 객체
+   * @param {boolean} isRetry - 재시도 여부 (tagCondition 오류 강조 경고 추가)
    */
-  buildTaggingPrompt(rule) {
+  buildTaggingPrompt(rule, isRetry = false) {
     const tagDescriptions = this.tagLoader.getTagDescriptionsForPrompt();
-    
-    // 이슈에서 온 룰인 경우 코드 정보 포함
+
     const hasCode = rule.problematicCode || rule.fixedCode;
-    
     let codeSection = '';
     if (hasCode) {
       codeSection = `
-## 코드 예시 (패턴 추출 시 참고)
+## 코드 예시 (antiPatterns/goodPatterns 작성 시 참고용)
+⚠️ 아래 코드는 정규식 패턴 작성에만 참고하세요. tagCondition에 코드를 넣지 마세요.
+
 ### 문제 코드
 \`\`\`java
 ${(rule.problematicCode || '없음').substring(0, 800)}
@@ -200,9 +283,18 @@ ${(rule.fixedCode || '없음').substring(0, 800)}
 `;
     }
 
+    // ✅ [Fix v4.4] 재시도 시 tagCondition 오류 강조 경고를 프롬프트 맨 앞에 배치
+    const retryWarning = isRetry ? `
+⛔⛔⛔ 이전 응답이 거부되었습니다 ⛔⛔⛔
+tagCondition에 소문자 식별자나 실제 Java 코드(예: writer.setRecord, conn.close())가
+포함되어 있었습니다. 이는 절대 금지입니다.
+tagCondition에는 아래 태그 목록의 대문자 태그명과 &&/||/! 연산자만 사용하세요.
+
+` : '';
+
     return `당신은 금융권 Java 코드 품질 전문가입니다.
 다음 규칙을 분석하고, 이 규칙이 적용되어야 하는 코드의 특성을 태그와 패턴으로 표현해주세요.
-
+${retryWarning}
 ═══════════════════════════════════════════════════════════════════════════════
 ## 금융권 핵심 원칙: "탐지는 넓게, 검증은 LLM"
 ═══════════════════════════════════════════════════════════════════════════════
@@ -212,6 +304,27 @@ ${(rule.fixedCode || '없음').substring(0, 800)}
 - 패턴은 넓게 작성하여 의심 코드를 최대한 탐지
 - LLM이 실제 문제인지 최종 판단
 - 확실하지 않으면 llm_contextual 또는 llm_with_regex 선택
+
+═══════════════════════════════════════════════════════════════════════════════
+## ⛔ tagCondition 작성 규칙 (위반 시 응답 전체 거부됨)
+═══════════════════════════════════════════════════════════════════════════════
+
+tagCondition에는 반드시 아래 [사용 가능한 태그 목록]에 있는 태그명만 사용하세요.
+
+✅ 허용: 대문자 태그명, &&, ||, !, ()
+   올바른 예시: "USES_CONNECTION && !HAS_TRY_WITH_RESOURCES"
+   올바른 예시: "IS_SERVICE || IS_DAO"
+   올바른 예시: "HAS_EMPTY_CATCH && !HAS_CLOSE_CALL"
+
+❌ 절대 금지 (이 중 하나라도 있으면 응답 거부):
+   - 소문자 식별자: writer, conn, record, service 등
+   - 점(.) 포함: writer.setRecord, conn.close()
+   - 메서드 호출 형식: hasConnection(), isValid()
+   - 코드 예시의 변수명이나 메서드명
+   - 태그 목록에 없는 임의 이름
+
+코드 예시(badExample, goodExample)는 antiPatterns/goodPatterns 패턴 작성에만 참고하고
+tagCondition에는 절대 코드를 넣지 마세요.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ## 규칙 정보
@@ -234,7 +347,7 @@ ${codeSection}
    - System.out.println, System.err.print
    - e.printStackTrace()
    - TODO, FIXME, XXX, HACK 주석
-   
+
    ❌ 다음은 pure_regex 금지:
    - 빈 catch 블록 → 의도적 무시일 수 있음 (llm_with_regex)
    - SQL 연결 → 동적 쿼리가 아닐 수 있음 (llm_with_regex)
@@ -262,7 +375,7 @@ ${codeSection}
 ═══════════════════════════════════════════════════════════════════════════════
 
 {
-  "tagCondition": "태그 논리 표현식 (예: USES_CONNECTION && !HAS_TRY_WITH_RESOURCES)",
+  "tagCondition": "대문자 태그명과 &&/||/! 연산자만 사용. 소문자·코드·메서드 호출 절대 금지",
   "requiredTags": ["필수 태그 배열 - 이 태그가 있어야 규칙 적용"],
   "excludeTags": ["제외 태그 배열 - 이 태그가 있으면 규칙 미적용"],
   "checkType": "llm_with_regex | llm_contextual | llm_with_ast | pure_regex",
@@ -298,17 +411,12 @@ ${codeSection}
    - 특수문자 이스케이프: \\., \\(, \\)
    - 대소문자 무시: flags에 "i" 추가
 
-═══════════════════════════════════════════════════════════════════════════════
-## 주의사항
-═══════════════════════════════════════════════════════════════════════════════
-
-1. 금융권에서는 문제를 놓치는 것이 가장 위험합니다
-2. 확실하지 않으면 llm_with_regex 또는 llm_contextual 선택
-3. pure_regex는 정말 100% 확실한 경우만 (System.out.print, printStackTrace 등)
-4. 코드 예시가 있으면 반드시 참고하여 패턴 추출
-
 JSON만 출력하세요.`;
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 패턴 정규화
+  // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * 패턴 배열 정규화
@@ -318,37 +426,32 @@ JSON만 출력하세요.`;
     if (!patterns || !Array.isArray(patterns)) {
       return [];
     }
-    
+
     return patterns.map(p => {
       let patternStr, flags, description;
-      
-      // 이미 객체인 경우
+
       if (typeof p === 'object' && p.pattern) {
         patternStr = p.pattern;
         flags = p.flags || 'g';
         description = p.description || '';
-      }
-      // 문자열인 경우
-      else if (typeof p === 'string') {
+      } else if (typeof p === 'string') {
         patternStr = p;
         flags = 'g';
         description = '';
-      }
-      else {
+      } else {
         return null;
       }
-      
-      // 🔧 PCRE → JavaScript 변환
+
+      // PCRE → JavaScript 변환
       const converted = this._convertPCREtoJS(patternStr, flags);
       patternStr = converted.pattern;
       flags = converted.flags;
-      
-      // 🔧 유효성 검증: RegExp로 변환 가능한지 테스트
+
+      // 유효성 검증
       try {
         new RegExp(patternStr, flags);
         return { pattern: patternStr, flags, description };
       } catch (e) {
-        // 추가 정제 시도
         const sanitized = this._sanitizePattern(patternStr);
         try {
           new RegExp(sanitized, flags);
@@ -361,105 +464,78 @@ JSON만 출력하세요.`;
       }
     }).filter(p => p !== null && p.pattern);
   }
-  
+
   /**
    * PCRE 정규식을 JavaScript RegExp로 변환
    * @private
    */
   _convertPCREtoJS(pattern, flags) {
     let newPattern = pattern;
-    let newFlags = flags;
-    
-    // 1. Inline flags 추출 및 제거: (?i), (?s), (?m), (?x), (?imsx) 등
-    const inlineFlagMatch = newPattern.match(/^\(\?([imsx]+)\)/);
-    if (inlineFlagMatch) {
-      const inlineFlags = inlineFlagMatch[1];
-      newPattern = newPattern.replace(/^\(\?[imsx]+\)/, '');
-      
-      // flags에 추가 (중복 제거)
-      if (inlineFlags.includes('i') && !newFlags.includes('i')) {
-        newFlags += 'i';
+    const flagSet = new Set(flags.split('').filter(Boolean));
+
+    // 1. 패턴 어디에나 있는 인라인 플래그 (?i) (?s) (?m) (?x) (?-i) 등 전부 처리
+    //    패턴 중간에 있어도 동일하게 적용
+    newPattern = newPattern.replace(/\(\?([a-zA-Z\-]+)\)/g, (match, flagStr) => {
+      let negate = false;
+      for (const ch of flagStr) {
+        if (ch === '-') { negate = true; continue; }
+        if (negate) continue;           // (?-i) 비활성화 → 제거만
+        if (ch === 'i') flagSet.add('i');
+        else if (ch === 'm') flagSet.add('m');
+        else if (ch === 's') flagSet.add('s'); // ← 핵심 수정: s 플래그 추가
+        // x(verbose)는 JS 미지원, 무시
       }
-      if (inlineFlags.includes('m') && !newFlags.includes('m')) {
-        newFlags += 'm';
-      }
-      // (?s) dotall - JavaScript에서는 [\\s\\S] 사용해야 함
-      // (?x) verbose - JavaScript에서 미지원, 공백 제거 필요
-    }
-    
-    // 2. 패턴 중간의 inline flags도 제거: (?i:...), (?:...) 등
+      return '';  // 인라인 플래그 패턴 제거
+    });
+
+    // 2. 패턴 중간의 (?i:...) 형태 → (?:...)
     newPattern = newPattern.replace(/\(\?[imsx]+:/g, '(?:');
-    newPattern = newPattern.replace(/\(\?[imsx]+\)/g, '');
-    
-    // 3. PCRE 전용 기능 변환
-    // (?s) dotall 모드의 . → [\s\S]로 변환 (이미 [\s\S] 사용 중이면 유지)
-    // 주의: 이건 복잡하므로 일단 보류
-    
-    // 4. Atomic groups (?>...) → (?:...) (JavaScript 미지원)
+
+    // 3. Atomic groups (?>...) → (?:...)
     newPattern = newPattern.replace(/\(\?>/g, '(?:');
-    
-    // 5. Possessive quantifiers ++, *+, ?+ → +, *, ? (JavaScript 미지원)
+
+    // 4. Possessive quantifiers
     newPattern = newPattern.replace(/\+\+/g, '+');
     newPattern = newPattern.replace(/\*\+/g, '*');
     newPattern = newPattern.replace(/\?\+/g, '?');
-    
-    // 6. Named groups (?P<name>...) → (?<name>...) (ES2018+)
+
+    // 5. Named groups (?P<name>...) → (?<name>...)
     newPattern = newPattern.replace(/\(\?P</g, '(?<');
-    
-    // 7. Named backreference (?P=name) → \k<name> (ES2018+)
+
+    // 6. Named backreference (?P=name) → \k<name>
     newPattern = newPattern.replace(/\(\?P=(\w+)\)/g, '\\k<$1>');
-    
-    return { pattern: newPattern, flags: newFlags };
+
+    return { pattern: newPattern, flags: [...flagSet].join('') };
   }
-  
+
   /**
    * 패턴 추가 정제 (변환 후에도 실패할 경우)
    * @private
    */
   _sanitizePattern(pattern) {
     let sanitized = pattern;
-    
-    // 짝이 맞지 않는 괄호 제거 시도
-    // 닫히지 않은 문자 클래스 [] 체크
-    let bracketCount = 0;
     let parenCount = 0;
     let inBracket = false;
-    
+
     for (let i = 0; i < sanitized.length; i++) {
       const char = sanitized[i];
       const prevChar = i > 0 ? sanitized[i - 1] : '';
-      
+
       if (prevChar !== '\\') {
-        if (char === '[' && !inBracket) {
-          inBracket = true;
-          bracketCount++;
-        } else if (char === ']' && inBracket) {
-          inBracket = false;
-        } else if (char === '(' && !inBracket) {
-          parenCount++;
-        } else if (char === ')' && !inBracket) {
-          parenCount--;
-        }
+        if (char === '[' && !inBracket) inBracket = true;
+        else if (char === ']' && inBracket) inBracket = false;
+        else if (char === '(' && !inBracket) parenCount++;
+        else if (char === ')' && !inBracket) parenCount--;
       }
     }
-    
-    // 닫히지 않은 괄호가 있으면 간단히 제거
-    if (parenCount > 0) {
-      // 끝에 닫는 괄호 추가
-      sanitized += ')'.repeat(parenCount);
-    } else if (parenCount < 0) {
-      // 시작에 여는 괄호 추가 (비정상적인 케이스)
-      sanitized = '('.repeat(-parenCount) + sanitized;
-    }
-    
-    // 닫히지 않은 문자 클래스
-    if (inBracket) {
-      sanitized += ']';
-    }
-    
+
+    if (parenCount > 0) sanitized += ')'.repeat(parenCount);
+    else if (parenCount < 0) sanitized = '('.repeat(-parenCount) + sanitized;
+    if (inBracket) sanitized += ']';
+
     return sanitized;
   }
-  
+
   /**
    * 정규식 특수문자 이스케이프
    * @private
@@ -468,20 +544,23 @@ JSON만 출력하세요.`;
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 폴백 태그
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
    * 폴백 태그 적용 (LLM 실패 시)
-   * 
+   *
    * 금융권 원칙: 모든 폴백은 LLM 검증 포함 (pure_regex 제외)
    */
   applyFallbackTags(rule) {
     const category = rule.category?.toLowerCase() || 'general';
-    
-    // 카테고리 기반 기본 태그 (모두 LLM 검증 포함)
+
     const categoryTagMap = {
       'resource_management': {
         tagCondition: 'USES_CONNECTION || USES_STATEMENT || USES_RESULTSET || USES_STREAM',
         requiredTags: [],
-        checkType: 'llm_with_regex',  // LLM 검증 필수
+        checkType: 'llm_with_regex',
         antiPatterns: [
           { pattern: 'Connection\\s+\\w+', flags: 'g', description: 'Connection 변수 사용' },
           { pattern: 'Statement\\s+\\w+', flags: 'g', description: 'Statement 변수 사용' },
@@ -506,7 +585,7 @@ JSON만 출력하세요.`;
       'security': {
         tagCondition: 'HAS_SQL_CONCATENATION || HAS_HARDCODED_PASSWORD',
         requiredTags: [],
-        checkType: 'llm_with_regex',  // SQL Injection 등은 문맥 확인 필요
+        checkType: 'llm_with_regex',
         antiPatterns: [
           { pattern: '"SELECT[^"]*"\\s*\\+', flags: 'gi', description: 'SQL 문자열 연결' },
           { pattern: '"INSERT[^"]*"\\s*\\+', flags: 'gi', description: 'SQL 문자열 연결' },
@@ -519,7 +598,7 @@ JSON만 출력하세요.`;
       'exception_handling': {
         tagCondition: 'HAS_EMPTY_CATCH || HAS_GENERIC_CATCH',
         requiredTags: [],
-        checkType: 'llm_with_regex',  // 의도적 무시 vs 실수 판단 필요
+        checkType: 'llm_with_regex',
         antiPatterns: [
           { pattern: 'catch\\s*\\([^)]+\\)\\s*\\{\\s*\\}', flags: 'g', description: '빈 catch 블록' },
           { pattern: 'catch\\s*\\(\\s*Exception\\s+\\w+\\s*\\)', flags: 'g', description: '범용 Exception 캐치' }
@@ -532,28 +611,28 @@ JSON만 출력하세요.`;
       'performance': {
         tagCondition: 'HAS_DB_CALL_IN_LOOP || HAS_NESTED_LOOP',
         requiredTags: [],
-        checkType: 'llm_contextual',  // N+1 등 의미 분석 필요
+        checkType: 'llm_contextual',
         antiPatterns: [],
         goodPatterns: []
       },
       'concurrency': {
         tagCondition: 'HAS_LOOP',
         requiredTags: [],
-        checkType: 'llm_contextual',  // 동시성 이슈는 문맥 분석 필요
+        checkType: 'llm_contextual',
         antiPatterns: [],
         goodPatterns: []
       },
       'architecture': {
         tagCondition: 'IS_CONTROLLER || IS_SERVICE || IS_DAO',
         requiredTags: [],
-        checkType: 'llm_contextual',  // 레이어 위반 등 의미 분석 필요
+        checkType: 'llm_contextual',
         antiPatterns: [],
         goodPatterns: []
       },
       'business_logic': {
         tagCondition: 'IS_SERVICE || IS_DAO',
         requiredTags: [],
-        checkType: 'llm_contextual',  // 비즈니스 로직 오류는 LLM 필수
+        checkType: 'llm_contextual',
         antiPatterns: [],
         goodPatterns: []
       },
@@ -577,7 +656,7 @@ JSON만 출력하세요.`;
       'transaction': {
         tagCondition: 'IS_SERVICE',
         requiredTags: [],
-        checkType: 'llm_contextual',  // 트랜잭션 경계는 의미 분석 필요
+        checkType: 'llm_contextual',
         antiPatterns: [],
         goodPatterns: []
       },
@@ -600,7 +679,7 @@ JSON만 출력하세요.`;
     const defaultTags = categoryTagMap[category] || {
       tagCondition: null,
       requiredTags: [],
-      checkType: 'llm_contextual',  // 기본값: LLM 검증
+      checkType: 'llm_contextual',
       antiPatterns: [],
       goodPatterns: []
     };
@@ -619,6 +698,10 @@ JSON만 출력하세요.`;
     };
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 유틸리티
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
    * sleep 유틸리티
    * @private
@@ -628,9 +711,10 @@ JSON만 출력하세요.`;
   }
 }
 
-/**
- * 싱글톤 인스턴스
- */
+// ═══════════════════════════════════════════════════════════════════════════
+// Singleton
+// ═══════════════════════════════════════════════════════════════════════════
+
 let instance = null;
 
 export function getRuleTagger() {
